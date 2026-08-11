@@ -109,13 +109,26 @@ app.get("/api/probable-pitchers", async (req, res) => {
       `probables-${date}`,
       `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher(stats(type=season,group=pitching))`
     );
+    const pitcherInfo = (p) => {
+      if (!p) return { name: "Por confirmar", hand: null, era: null };
+      const s = p.stats?.find((st) => st.group?.displayName === "pitching")?.splits?.[0]?.stat;
+      return {
+        name: p.fullName,
+        hand: p.pitchHand?.code || null,
+        era: s?.era != null ? parseFloat(s.era) : null,
+      };
+    };
     const games = (data.dates?.[0]?.games || []).map((g) => ({
       home: g.teams.home.team.name,
       away: g.teams.away.team.name,
       venue: g.venue?.name,
       time: g.gameDate,
-      homePitcher: g.teams.home.probablePitcher?.fullName || "Por confirmar",
-      awayPitcher: g.teams.away.probablePitcher?.fullName || "Por confirmar",
+      homePitcher: pitcherInfo(g.teams.home.probablePitcher).name,
+      homePitcherHand: pitcherInfo(g.teams.home.probablePitcher).hand,
+      homePitcherEra: pitcherInfo(g.teams.home.probablePitcher).era,
+      awayPitcher: pitcherInfo(g.teams.away.probablePitcher).name,
+      awayPitcherHand: pitcherInfo(g.teams.away.probablePitcher).hand,
+      awayPitcherEra: pitcherInfo(g.teams.away.probablePitcher).era,
     }));
     res.json({ date, updated: new Date().toISOString(), games });
   } catch (err) {
