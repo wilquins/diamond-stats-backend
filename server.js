@@ -85,6 +85,7 @@ app.get("/api/team/:code/hitters", async (req, res) => {
         return {
           name: p.person.fullName,
           pos: p.position.abbreviation,
+          bats: p.person.batSide?.code || null, // "L" | "R" | "S" (switch) | null si no viene
           g: s.gamesPlayed, ab: s.atBats, h: s.hits,
           doubles: s.doubles, triples: s.triples, hr: s.homeRuns,
           rbi: s.rbi, avg: s.avg, obp: s.obp, slg: s.slg, ops: s.ops,
