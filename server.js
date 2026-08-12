@@ -66,6 +66,63 @@ function describeWeatherCode(code) {
   return { desc: "Sin datos", icon: "🌡️" };
 }
 
+// Convierte una etiqueta de punto cardinal ("NW") a grados aproximados —
+// el Servicio Meteorológico Nacional (NWS) da la dirección como texto, no
+// en grados, así que hacemos la conversión inversa para dibujar la flecha.
+function compassToDeg(label) {
+  const dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+  const i = dirs.indexOf(label);
+  return i === -1 ? 0 : i * 22.5;
+}
+
+// Trae el clima real vía el National Weather Service (gobierno de EE.UU.,
+// gratis, sin llave, y sin el problema de límites por IP compartida que
+// tiene Open-Meteo en hosting gratuito). Solo cubre EE.UU. — Toronto usa
+// Open-Meteo como respaldo, siendo el único equipo fuera de EE.UU.
+async function fetchWeatherNWS(lat, lon, cacheKey) {
+  const hit = cache.get(cacheKey);
+  if (hit && Date.now() - hit.time < WEATHER_CACHE_TTL_MS) return hit.data;
+
+  const headers = { "User-Agent": "DiamondStatsApp (proyecto personal de estadisticas MLB)" };
+  const pointsUrl = `https://api.weather.gov/points/${lat},${lon}`;
+  const pointsRes = await fetch(pointsUrl, { headers });
+  if (!pointsRes.ok) throw new Error(`Error ${pointsRes.status} consultando ${pointsUrl}`);
+  const points = await pointsRes.json();
+  const hourlyUrl = points.properties.forecastHourly;
+
+  const forecastRes = await fetch(hourlyUrl, { headers });
+  if (!forecastRes.ok) throw new Error(`Error ${forecastRes.status} consultando ${hourlyUrl}`);
+  const forecast = await forecastRes.json();
+  const now = forecast.properties.periods[0];
+
+  const windMph = parseFloat(now.windSpeed) || 0; // viene como texto "10 mph"
+  const data = {
+    tempF: now.temperature,
+    humidity: now.relativeHumidity?.value ?? null,
+    windMph,
+    windDir: now.windDirection,
+    windDirDeg: compassToDeg(now.windDirection),
+    pop: now.probabilityOfPrecipitation?.value ?? 0,
+    description: now.shortForecast,
+    icon: iconForForecast(now.shortForecast),
+  };
+  cache.set(cacheKey, { data, time: Date.now() });
+  return data;
+}
+
+// Traduce la descripción corta del NWS a un ícono simple.
+function iconForForecast(text) {
+  const t = (text || "").toLowerCase();
+  if (t.includes("thunder") || t.includes("storm")) return "⛈️";
+  if (t.includes("snow")) return "🌨️";
+  if (t.includes("rain") || t.includes("shower")) return "🌧️";
+  if (t.includes("fog")) return "🌫️";
+  if (t.includes("cloud") && t.includes("mostly")) return "☁️";
+  if (t.includes("cloud")) return "⛅";
+  if (t.includes("clear") || t.includes("sunny")) return "☀️";
+  return "🌤️";
+}
+
 // Convierte grados de dirección del viento (0-360) a un punto cardinal
 // legible, tipo "NNW".
 function windDirectionLabel(deg) {
@@ -354,25 +411,27 @@ app.get("/api/game/:gamePk/lineup", async (req, res) => {
 // Clima real ahora mismo en el estadio de ese equipo — usa Open-Meteo
 // (gratuita, sin llave, como la MLB Stats API).
 app.get("/api/weather/:code", async (req, res) => {
-  const coords = STADIUM_COORDS[req.params.code.toUpperCase()];
+  const code = req.params.code.toUpperCase();
+  const coords = STADIUM_COORDS[code];
   if (!coords) return res.status(404).json({ error: "Código de equipo no reconocido" });
 
   try {
-    const url = `https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation_probability,weather_code&temperature_unit=fahrenheit&wind_speed_unit=mph`;
-    const data = await cachedFetch(`weather-${req.params.code}`, url, WEATHER_CACHE_TTL_MS);
-    const c = data.current;
-    const w = describeWeatherCode(c.weather_code);
-    res.json({
-      updated: new Date().toISOString(),
-      tempF: c.temperature_2m,
-      humidity: c.relative_humidity_2m,
-      windMph: c.wind_speed_10m,
-      windDir: windDirectionLabel(c.wind_direction_10m),
-      windDirDeg: c.wind_direction_10m, // grados exactos (0-360), para dibujar la flecha
-      pop: c.precipitation_probability,
-      description: w.desc,
-      icon: w.icon,
-    });
+    let data;
+    if (code === "TOR") {
+      // Único equipo fuera de EE.UU. — el NWS no cubre Canadá, usa Open-Meteo.
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation_probability,weather_code&temperature_unit=fahrenheit&wind_speed_unit=mph`;
+      const raw = await cachedFetch(`weather-${code}`, url, WEATHER_CACHE_TTL_MS);
+      const c = raw.current;
+      const w = describeWeatherCode(c.weather_code);
+      data = {
+        tempF: c.temperature_2m, humidity: c.relative_humidity_2m, windMph: c.wind_speed_10m,
+        windDir: windDirectionLabel(c.wind_direction_10m), windDirDeg: c.wind_direction_10m,
+        pop: c.precipitation_probability, description: w.desc, icon: w.icon,
+      };
+    } else {
+      data = await fetchWeatherNWS(coords.lat, coords.lon, `weather-${code}`);
+    }
+    res.json({ updated: new Date().toISOString(), ...data });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
