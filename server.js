@@ -31,6 +31,48 @@ const TEAM_IDS = {
 };
 const TEAM_ID_TO_CODE = Object.fromEntries(Object.entries(TEAM_IDS).map(([code, id]) => [id, code]));
 
+// Coordenadas aproximadas (nivel ciudad, suficiente para clima) de los 30
+// estadios reales — usadas para consultar el clima real de cada partido.
+const STADIUM_COORDS = {
+  ARI: { lat: 33.4453, lon: -112.0667 }, ATL: { lat: 33.8908, lon: -84.4678 },
+  BAL: { lat: 39.2839, lon: -76.6218 }, BOS: { lat: 42.3467, lon: -71.0972 },
+  CHC: { lat: 41.9484, lon: -87.6553 }, CWS: { lat: 41.8299, lon: -87.6338 },
+  CIN: { lat: 39.0979, lon: -84.5082 }, CLE: { lat: 41.4962, lon: -81.6852 },
+  COL: { lat: 39.7559, lon: -104.9942 }, DET: { lat: 42.3390, lon: -83.0485 },
+  HOU: { lat: 29.7573, lon: -95.3555 }, KC: { lat: 39.0517, lon: -94.4803 },
+  LAA: { lat: 33.8003, lon: -117.8827 }, LAD: { lat: 34.0739, lon: -118.2400 },
+  MIA: { lat: 25.7781, lon: -80.2196 }, MIL: { lat: 43.0280, lon: -87.9712 },
+  MIN: { lat: 44.9817, lon: -93.2775 }, NYM: { lat: 40.7571, lon: -73.8458 },
+  NYY: { lat: 40.8296, lon: -73.9262 }, ATH: { lat: 38.5802, lon: -121.5133 },
+  PHI: { lat: 39.9061, lon: -75.1665 }, PIT: { lat: 40.4469, lon: -80.0057 },
+  SD: { lat: 32.7073, lon: -117.1566 }, SF: { lat: 37.7786, lon: -122.3893 },
+  SEA: { lat: 47.5914, lon: -122.3325 }, STL: { lat: 38.6226, lon: -90.1928 },
+  TB: { lat: 27.7683, lon: -82.6534 }, TEX: { lat: 32.7473, lon: -97.0842 },
+  TOR: { lat: 43.6414, lon: -79.3894 }, WSH: { lat: 38.8730, lon: -77.0074 },
+};
+
+// Traduce el "weather code" estándar (WMO) que usa Open-Meteo a una
+// descripción y emoji simples.
+function describeWeatherCode(code) {
+  if (code === 0) return { desc: "Despejado", icon: "☀️" };
+  if (code <= 2) return { desc: "Parcialmente nublado", icon: "⛅" };
+  if (code === 3) return { desc: "Nublado", icon: "☁️" };
+  if (code <= 48) return { desc: "Neblina", icon: "🌫️" };
+  if (code <= 57) return { desc: "Llovizna", icon: "🌦️" };
+  if (code <= 67) return { desc: "Lluvia", icon: "🌧️" };
+  if (code <= 77) return { desc: "Nieve", icon: "🌨️" };
+  if (code <= 82) return { desc: "Chubascos", icon: "🌦️" };
+  if (code <= 99) return { desc: "Tormenta", icon: "⛈️" };
+  return { desc: "Sin datos", icon: "🌡️" };
+}
+
+// Convierte grados de dirección del viento (0-360) a un punto cardinal
+// legible, tipo "NNW".
+function windDirectionLabel(deg) {
+  const dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+  return dirs[Math.round(deg / 22.5) % 16];
+}
+
 async function cachedFetch(key, url) {
   const hit = cache.get(key);
   if (hit && Date.now() - hit.time < CACHE_TTL_MS) return hit.data;
@@ -300,6 +342,34 @@ app.get("/api/game/:gamePk/lineup", async (req, res) => {
       available: home.length > 0 || away.length > 0,
       home,
       away,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/weather/:code ----
+// Clima real ahora mismo en el estadio de ese equipo — usa Open-Meteo
+// (gratuita, sin llave, como la MLB Stats API).
+app.get("/api/weather/:code", async (req, res) => {
+  const coords = STADIUM_COORDS[req.params.code.toUpperCase()];
+  if (!coords) return res.status(404).json({ error: "Código de equipo no reconocido" });
+
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation_probability,weather_code&temperature_unit=fahrenheit&wind_speed_unit=mph`;
+    const data = await cachedFetch(`weather-${req.params.code}`, url);
+    const c = data.current;
+    const w = describeWeatherCode(c.weather_code);
+    res.json({
+      updated: new Date().toISOString(),
+      tempF: c.temperature_2m,
+      humidity: c.relative_humidity_2m,
+      windMph: c.wind_speed_10m,
+      windDir: windDirectionLabel(c.wind_direction_10m),
+      windDirDeg: c.wind_direction_10m, // grados exactos (0-360), para dibujar la flecha
+      pop: c.precipitation_probability,
+      description: w.desc,
+      icon: w.icon,
     });
   } catch (err) {
     res.status(502).json({ error: err.message });
