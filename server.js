@@ -69,6 +69,32 @@ app.get("/api/standings", async (req, res) => {
 });
 
 // ---- GET /api/team/:code/hitters ----
+// Trae el split REAL de un jugador contra zurdos y derechos, con una
+// llamada dedicada (la combinada con el roster daba error 400 en la MLB
+// API, esta ruta separada sí acepta sitCodes múltiples). Se cachea por
+// jugador para no repetir la llamada en cada visita.
+async function fetchPlayerSplits(personId) {
+  try {
+    const data = await cachedFetch(
+      `splits-${personId}`,
+      `${MLB_API}/people/${personId}/stats?stats=season&group=hitting&sitCodes=vl,vr`
+    );
+    const blocks = data.stats || [];
+    const findBlock = (code) => blocks.find((b) => b.type?.sitCodes?.includes(code))?.splits?.[0]?.stat;
+    const toSplit = (block) => {
+      if (!block || block.atBats == null || block.atBats < 15) return null; // muestra muy chica, mejor no mostrarla
+      return {
+        ab: block.atBats,
+        avg: block.avg != null ? parseFloat(block.avg) : null,
+        ops: block.ops != null ? parseFloat(block.ops) : null,
+      };
+    };
+    return { vsL: toSplit(findBlock("vl")), vsR: toSplit(findBlock("vr")) };
+  } catch {
+    return { vsL: null, vsR: null }; // si falla para un jugador puntual, no rompe el resto del equipo
+  }
+}
+
 // Bateadores reales de un equipo con sus stats actuales de temporada.
 app.get("/api/team/:code/hitters", async (req, res) => {
   const teamId = TEAM_IDS[req.params.code.toUpperCase()];
@@ -79,11 +105,12 @@ app.get("/api/team/:code/hitters", async (req, res) => {
       `hitters-${teamId}`,
       `${MLB_API}/teams/${teamId}/roster?rosterType=active&hydrate=person(stats(type=season,group=hitting))`
     );
-    const hitters = data.roster
+    const rawHitters = data.roster
       .filter((p) => p.position.abbreviation !== "P")
       .map((p) => {
         const s = p.person.stats?.[0]?.splits?.[0]?.stat || {};
         return {
+          id: p.person.id,
           name: p.person.fullName,
           pos: p.position.abbreviation,
           bats: p.person.batSide?.code || null, // "L" | "R" | "S" (switch) | null si no viene
@@ -94,11 +121,14 @@ app.get("/api/team/:code/hitters", async (req, res) => {
           obp: s.obp != null ? parseFloat(s.obp) : null,
           slg: s.slg != null ? parseFloat(s.slg) : null,
           ops: s.ops != null ? parseFloat(s.ops) : null,
-          vsL: null, // pendiente: la MLB API rechazó combinar esto en una sola llamada — se agregará en otra ronda con una llamada separada por jugador
-          vsR: null,
         };
       })
       .filter((p) => p.ab > 0 && p.avg != null && !Number.isNaN(p.avg));
+
+    // Trae el split real de cada bateador en paralelo (uno por jugador).
+    const splitsResults = await Promise.all(rawHitters.map((p) => fetchPlayerSplits(p.id)));
+    const hitters = rawHitters.map((p, i) => ({ ...p, vsL: splitsResults[i].vsL, vsR: splitsResults[i].vsR }));
+
     res.json({ updated: new Date().toISOString(), hitters });
   } catch (err) {
     res.status(502).json({ error: err.message });
