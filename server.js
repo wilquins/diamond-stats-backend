@@ -69,30 +69,31 @@ app.get("/api/standings", async (req, res) => {
 });
 
 // ---- GET /api/team/:code/hitters ----
-// Trae el split REAL de un jugador contra zurdos y derechos, con una
-// llamada dedicada (la combinada con el roster daba error 400 en la MLB
-// API, esta ruta separada sí acepta sitCodes múltiples). Se cachea por
-// jugador para no repetir la llamada en cada visita.
-async function fetchPlayerSplits(personId) {
+// Trae el split REAL de un jugador contra zurdos y derechos. El formato
+// correcto de la MLB API es stats=statSplits con UN sitCode por llamada
+// (probamos combinarlos con coma y con stats=season, ninguno funcionaba —
+// esta es la combinación que sí responde con el split real). Se cachea
+// por jugador y situación para no repetir la llamada en cada visita.
+async function fetchOneSplit(personId, sitCode) {
   try {
     const data = await cachedFetch(
-      `splits-${personId}`,
-      `${MLB_API}/people/${personId}/stats?stats=season&group=hitting&sitCodes=vl,vr`
+      `split-${personId}-${sitCode}`,
+      `${MLB_API}/people/${personId}/stats?stats=statSplits&group=hitting&sitCodes=${sitCode}`
     );
-    const blocks = data.stats || [];
-    const findBlock = (code) => blocks.find((b) => b.type?.sitCodes?.includes(code))?.splits?.[0]?.stat;
-    const toSplit = (block) => {
-      if (!block || block.atBats == null || block.atBats < 15) return null; // muestra muy chica, mejor no mostrarla
-      return {
-        ab: block.atBats,
-        avg: block.avg != null ? parseFloat(block.avg) : null,
-        ops: block.ops != null ? parseFloat(block.ops) : null,
-      };
+    const block = data.stats?.[0]?.splits?.[0]?.stat;
+    if (!block || block.atBats == null || block.atBats < 15) return null; // muestra muy chica, mejor no mostrarla
+    return {
+      ab: block.atBats,
+      avg: block.avg != null ? parseFloat(block.avg) : null,
+      ops: block.ops != null ? parseFloat(block.ops) : null,
     };
-    return { vsL: toSplit(findBlock("vl")), vsR: toSplit(findBlock("vr")) };
   } catch {
-    return { vsL: null, vsR: null }; // si falla para un jugador puntual, no rompe el resto del equipo
+    return null; // si falla para un jugador puntual, no rompe el resto del equipo
   }
+}
+async function fetchPlayerSplits(personId) {
+  const [vsL, vsR] = await Promise.all([fetchOneSplit(personId, "vl"), fetchOneSplit(personId, "vr")]);
+  return { vsL, vsR };
 }
 
 // Bateadores reales de un equipo con sus stats actuales de temporada.
@@ -204,17 +205,6 @@ app.get("/api/probable-pitchers", async (req, res) => {
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
-});
-
-// ---- TEMPORAL: GET /api/debug/splits/:personId ----
-// Solo para diagnosticar el problema de los splits vs. zurdo/derecho — NO
-// atrapa el error, así vemos el mensaje real de la MLB API o la estructura
-// exacta de la respuesta. Se puede borrar una vez resuelto.
-app.get("/api/debug/splits/:personId", async (req, res) => {
-  const url = `${MLB_API}/people/${req.params.personId}/stats?stats=statSplits&group=hitting&sitCodes=vl`;
-  const r = await fetch(url);
-  const text = await r.text();
-  res.status(r.status).type("text/plain").send(`URL: ${url}\nStatus: ${r.status}\n\n${text}`);
 });
 
 const PORT = process.env.PORT || 3000;
