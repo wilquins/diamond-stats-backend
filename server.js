@@ -29,6 +29,7 @@ const TEAM_IDS = {
   PIT: 134, SD: 135, SF: 137, SEA: 136, STL: 138, TB: 139, TEX: 140,
   TOR: 141, WSH: 120,
 };
+const TEAM_ID_TO_CODE = Object.fromEntries(Object.entries(TEAM_IDS).map(([code, id]) => [id, code]));
 
 async function cachedFetch(key, url) {
   const hit = cache.get(key);
@@ -171,3 +172,79 @@ app.get("/api/probable-pitchers", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`DiamondStats backend corriendo en puerto ${PORT}`));
+
+// ---- GET /api/games/today ----
+// Lista de todos los juegos reales programados para hoy (o la fecha que se
+// pida), con el ID de juego (gamePk) que se necesita para pedir su
+// alineación después.
+app.get("/api/games/today", async (req, res) => {
+  const date = req.query.date || new Date().toISOString().slice(0, 10);
+  try {
+    const data = await cachedFetch(
+      `games-today-${date}`,
+      `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher(stats(type=season,group=pitching))`
+    );
+    const pitcherInfo = (p) => {
+      if (!p) return { name: "Por confirmar", hand: null, era: null };
+      const s = p.stats?.find((st) => st.group?.displayName === "pitching")?.splits?.[0]?.stat;
+      return {
+        name: p.fullName,
+        hand: p.pitchHand?.code || null,
+        era: s?.era != null ? parseFloat(s.era) : null,
+      };
+    };
+    const games = (data.dates?.[0]?.games || []).map((g) => ({
+      gamePk: g.gamePk,
+      home: g.teams.home.team.name,
+      homeCode: TEAM_ID_TO_CODE[g.teams.home.team.id] || null,
+      away: g.teams.away.team.name,
+      awayCode: TEAM_ID_TO_CODE[g.teams.away.team.id] || null,
+      venue: g.venue?.name,
+      time: g.gameDate,
+      status: g.status?.detailedState || null,
+      homePitcher: pitcherInfo(g.teams.home.probablePitcher),
+      awayPitcher: pitcherInfo(g.teams.away.probablePitcher),
+    }));
+    res.json({ date, updated: new Date().toISOString(), games });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/game/:gamePk/lineup ----
+// Alineación titular real de ambos equipos para un juego específico.
+// IMPORTANTE: las alineaciones oficiales normalmente se publican solo
+// ~2 horas antes del primer lanzamiento — si el juego es más tarde, esto
+// puede venir vacío todavía, y se lo dejamos explícito en la respuesta.
+app.get("/api/game/:gamePk/lineup", async (req, res) => {
+  const { gamePk } = req.params;
+  try {
+    const data = await cachedFetch(
+      `lineup-${gamePk}`,
+      `${MLB_API}/game/${gamePk}/boxscore`
+    );
+    const buildLineup = (teamSide) => {
+      const team = data.teams?.[teamSide];
+      if (!team) return [];
+      const order = team.battingOrder || [];
+      return order
+        .map((playerId) => team.players?.[`ID${playerId}`])
+        .filter(Boolean)
+        .map((p) => ({
+          name: p.person?.fullName,
+          pos: p.position?.abbreviation,
+        }));
+    };
+    const home = buildLineup("home");
+    const away = buildLineup("away");
+    res.json({
+      gamePk,
+      updated: new Date().toISOString(),
+      available: home.length > 0 || away.length > 0,
+      home,
+      away,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
