@@ -98,6 +98,39 @@ app.get("/api/team/:code/hitters", async (req, res) => {
   }
 });
 
+// ---- GET /api/team/:code/pitchers ----
+// Pitchers reales de un equipo con sus stats actuales de temporada.
+app.get("/api/team/:code/pitchers", async (req, res) => {
+  const teamId = TEAM_IDS[req.params.code.toUpperCase()];
+  if (!teamId) return res.status(404).json({ error: "Código de equipo no reconocido" });
+
+  try {
+    const data = await cachedFetch(
+      `pitchers-${teamId}`,
+      `${MLB_API}/teams/${teamId}/roster?rosterType=active&hydrate=person(stats(type=season,group=pitching))`
+    );
+    const pitchers = data.roster
+      .filter((p) => p.position.abbreviation === "P")
+      .map((p) => {
+        const s = p.person.stats?.[0]?.splits?.[0]?.stat || {};
+        return {
+          name: p.person.fullName,
+          pos: p.position.abbreviation,
+          throws: p.person.pitchHand?.code || null, // "L" | "R" | null si no viene
+          g: s.gamesPlayed, gs: s.gamesStarted,
+          w: s.wins, l: s.losses, so: s.strikeOuts,
+          era: s.era != null ? parseFloat(s.era) : null,
+          whip: s.whip != null ? parseFloat(s.whip) : null,
+          ip: s.inningsPitched, k9: s.strikeoutsPer9Inn != null ? parseFloat(s.strikeoutsPer9Inn) : null,
+        };
+      })
+      .filter((p) => p.ip && parseFloat(p.ip) > 0);
+    res.json({ updated: new Date().toISOString(), pitchers });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // ---- GET /api/probable-pitchers?date=YYYY-MM-DD ----
 // Abridores probables REALES para una fecha específica — esto es lo que
 // resuelve el "próxima fase" que quedó pendiente en el prototipo: ya no
