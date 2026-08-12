@@ -73,16 +73,18 @@ function windDirectionLabel(deg) {
   return dirs[Math.round(deg / 22.5) % 16];
 }
 
-async function cachedFetch(key, url) {
+async function cachedFetch(key, url, ttlMs = CACHE_TTL_MS) {
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.time < CACHE_TTL_MS) return hit.data;
+  if (hit && Date.now() - hit.time < ttlMs) return hit.data;
 
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`MLB API error ${res.status} en ${url}`);
+  if (!res.ok) throw new Error(`Error ${res.status} consultando ${url}`);
   const data = await res.json();
   cache.set(key, { data, time: Date.now() });
   return data;
 }
+
+const WEATHER_CACHE_TTL_MS = 45 * 60 * 1000; // 45 minutos — el clima no cambia tan rápido, y así evitamos el límite de Open-Meteo
 
 // ---- GET /api/standings ----
 // Récords reales de los 30 equipos, actualizados en vivo.
@@ -357,7 +359,7 @@ app.get("/api/weather/:code", async (req, res) => {
 
   try {
     const url = `https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation_probability,weather_code&temperature_unit=fahrenheit&wind_speed_unit=mph`;
-    const data = await cachedFetch(`weather-${req.params.code}`, url);
+    const data = await cachedFetch(`weather-${req.params.code}`, url, WEATHER_CACHE_TTL_MS);
     const c = data.current;
     const w = describeWeatherCode(c.weather_code);
     res.json({
