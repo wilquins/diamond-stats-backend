@@ -89,10 +89,14 @@ app.get("/api/team/:code/hitters", async (req, res) => {
           bats: p.person.batSide?.code || null, // "L" | "R" | "S" (switch) | null si no viene
           g: s.gamesPlayed, ab: s.atBats, h: s.hits,
           doubles: s.doubles, triples: s.triples, hr: s.homeRuns,
-          rbi: s.rbi, avg: s.avg, obp: s.obp, slg: s.slg, ops: s.ops,
+          rbi: s.rbi,
+          avg: s.avg != null ? parseFloat(s.avg) : null,
+          obp: s.obp != null ? parseFloat(s.obp) : null,
+          slg: s.slg != null ? parseFloat(s.slg) : null,
+          ops: s.ops != null ? parseFloat(s.ops) : null,
         };
       })
-      .filter((p) => p.ab > 0);
+      .filter((p) => p.ab > 0 && p.avg != null && !Number.isNaN(p.avg));
     res.json({ updated: new Date().toISOString(), hitters });
   } catch (err) {
     res.status(502).json({ error: err.message });
