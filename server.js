@@ -77,12 +77,34 @@ app.get("/api/team/:code/hitters", async (req, res) => {
   try {
     const data = await cachedFetch(
       `hitters-${teamId}`,
-      `${MLB_API}/teams/${teamId}/roster?rosterType=active&hydrate=person(stats(type=season,group=hitting))`
+      `${MLB_API}/teams/${teamId}/roster?rosterType=active&hydrate=person(stats(type=season,group=hitting),stats(type=season,group=hitting,sitCodes=vl),stats(type=season,group=hitting,sitCodes=vr))`
     );
+    // Busca, dentro del arreglo de stats de la persona, el grupo que
+    // corresponde a cada situación (temporada completa, vs. zurdo, vs.
+    // derecho) — la API devuelve varios bloques y hay que identificarlos
+    // por su "type"/"sitCodes" en vez de por posición fija en el arreglo.
+    const findSplit = (statsArr, sitCode) => {
+      const block = (statsArr || []).find((s) => {
+        if (!sitCode) return s.type?.displayName === "season" && !s.type?.sitCodes;
+        return s.type?.sitCodes && s.type.sitCodes.includes(sitCode);
+      });
+      return block?.splits?.[0]?.stat || null;
+    };
     const hitters = data.roster
       .filter((p) => p.position.abbreviation !== "P")
       .map((p) => {
-        const s = p.person.stats?.[0]?.splits?.[0]?.stat || {};
+        const statsArr = p.person.stats;
+        const s = statsArr?.[0]?.splits?.[0]?.stat || {};
+        const vL = findSplit(statsArr, "vl");
+        const vR = findSplit(statsArr, "vr");
+        const toSplit = (block) => {
+          if (!block || block.atBats == null || block.atBats < 15) return null; // muestra muy chica, mejor no mostrarla
+          return {
+            ab: block.atBats,
+            avg: block.avg != null ? parseFloat(block.avg) : null,
+            ops: block.ops != null ? parseFloat(block.ops) : null,
+          };
+        };
         return {
           name: p.person.fullName,
           pos: p.position.abbreviation,
@@ -94,6 +116,8 @@ app.get("/api/team/:code/hitters", async (req, res) => {
           obp: s.obp != null ? parseFloat(s.obp) : null,
           slg: s.slg != null ? parseFloat(s.slg) : null,
           ops: s.ops != null ? parseFloat(s.ops) : null,
+          vsL: toSplit(vL), // split real vs. pitcher zurdo — null si no hay muestra suficiente
+          vsR: toSplit(vR), // split real vs. pitcher derecho — null si no hay muestra suficiente
         };
       })
       .filter((p) => p.ab > 0 && p.avg != null && !Number.isNaN(p.avg));
