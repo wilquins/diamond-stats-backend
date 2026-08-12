@@ -96,6 +96,18 @@ async function fetchPlayerSplits(personId) {
   return { vsL, vsR };
 }
 
+// El objeto "probablePitcher" que devuelve el calendario NO incluye su
+// mano de lanzar por defecto — hay que pedirla aparte, igual que hicimos
+// con los splits de los bateadores.
+async function fetchPitcherHand(personId) {
+  try {
+    const data = await cachedFetch(`hand-${personId}`, `${MLB_API}/people/${personId}`);
+    return data.people?.[0]?.pitchHand?.code || null;
+  } catch {
+    return null;
+  }
+}
+
 // Bateadores reales de un equipo con sus stats actuales de temporada.
 app.get("/api/team/:code/hitters", async (req, res) => {
   const teamId = TEAM_IDS[req.params.code.toUpperCase()];
@@ -180,27 +192,31 @@ app.get("/api/probable-pitchers", async (req, res) => {
       `probables-${date}`,
       `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher(stats(type=season,group=pitching))`
     );
-    const pitcherInfo = (p) => {
+    const pitcherInfo = async (p) => {
       if (!p) return { name: "Por confirmar", hand: null, era: null };
       const s = p.stats?.find((st) => st.group?.displayName === "pitching")?.splits?.[0]?.stat;
+      const hand = p.pitchHand?.code || (p.id ? await fetchPitcherHand(p.id) : null);
       return {
         name: p.fullName,
-        hand: p.pitchHand?.code || null,
+        hand,
         era: s?.era != null ? parseFloat(s.era) : null,
       };
     };
-    const games = (data.dates?.[0]?.games || []).map((g) => ({
-      home: g.teams.home.team.name,
-      away: g.teams.away.team.name,
-      venue: g.venue?.name,
-      time: g.gameDate,
-      homePitcher: pitcherInfo(g.teams.home.probablePitcher).name,
-      homePitcherHand: pitcherInfo(g.teams.home.probablePitcher).hand,
-      homePitcherEra: pitcherInfo(g.teams.home.probablePitcher).era,
-      awayPitcher: pitcherInfo(g.teams.away.probablePitcher).name,
-      awayPitcherHand: pitcherInfo(g.teams.away.probablePitcher).hand,
-      awayPitcherEra: pitcherInfo(g.teams.away.probablePitcher).era,
-    }));
+    const rawGames = data.dates?.[0]?.games || [];
+    const games = await Promise.all(
+      rawGames.map(async (g) => {
+        const home = await pitcherInfo(g.teams.home.probablePitcher);
+        const away = await pitcherInfo(g.teams.away.probablePitcher);
+        return {
+          home: g.teams.home.team.name,
+          away: g.teams.away.team.name,
+          venue: g.venue?.name,
+          time: g.gameDate,
+          homePitcher: home.name, homePitcherHand: home.hand, homePitcherEra: home.era,
+          awayPitcher: away.name, awayPitcherHand: away.hand, awayPitcherEra: away.era,
+        };
+      })
+    );
     res.json({ date, updated: new Date().toISOString(), games });
   } catch (err) {
     res.status(502).json({ error: err.message });
@@ -221,27 +237,31 @@ app.get("/api/games/today", async (req, res) => {
       `games-today-${date}`,
       `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher(stats(type=season,group=pitching))`
     );
-    const pitcherInfo = (p) => {
+    const pitcherInfo = async (p) => {
       if (!p) return { name: "Por confirmar", hand: null, era: null };
       const s = p.stats?.find((st) => st.group?.displayName === "pitching")?.splits?.[0]?.stat;
+      const hand = p.pitchHand?.code || (p.id ? await fetchPitcherHand(p.id) : null);
       return {
         name: p.fullName,
-        hand: p.pitchHand?.code || null,
+        hand,
         era: s?.era != null ? parseFloat(s.era) : null,
       };
     };
-    const games = (data.dates?.[0]?.games || []).map((g) => ({
-      gamePk: g.gamePk,
-      home: g.teams.home.team.name,
-      homeCode: TEAM_ID_TO_CODE[g.teams.home.team.id] || null,
-      away: g.teams.away.team.name,
-      awayCode: TEAM_ID_TO_CODE[g.teams.away.team.id] || null,
-      venue: g.venue?.name,
-      time: g.gameDate,
-      status: g.status?.detailedState || null,
-      homePitcher: pitcherInfo(g.teams.home.probablePitcher),
-      awayPitcher: pitcherInfo(g.teams.away.probablePitcher),
-    }));
+    const rawGames = data.dates?.[0]?.games || [];
+    const games = await Promise.all(
+      rawGames.map(async (g) => ({
+        gamePk: g.gamePk,
+        home: g.teams.home.team.name,
+        homeCode: TEAM_ID_TO_CODE[g.teams.home.team.id] || null,
+        away: g.teams.away.team.name,
+        awayCode: TEAM_ID_TO_CODE[g.teams.away.team.id] || null,
+        venue: g.venue?.name,
+        time: g.gameDate,
+        status: g.status?.detailedState || null,
+        homePitcher: await pitcherInfo(g.teams.home.probablePitcher),
+        awayPitcher: await pitcherInfo(g.teams.away.probablePitcher),
+      }))
+    );
     res.json({ date, updated: new Date().toISOString(), games });
   } catch (err) {
     res.status(502).json({ error: err.message });
