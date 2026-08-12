@@ -206,6 +206,17 @@ app.get("/api/probable-pitchers", async (req, res) => {
   }
 });
 
+// ---- TEMPORAL: GET /api/debug/splits/:personId ----
+// Solo para diagnosticar el problema de los splits vs. zurdo/derecho — NO
+// atrapa el error, así vemos el mensaje real de la MLB API o la estructura
+// exacta de la respuesta. Se puede borrar una vez resuelto.
+app.get("/api/debug/splits/:personId", async (req, res) => {
+  const url = `${MLB_API}/people/${req.params.personId}/stats?stats=season&group=hitting&sitCodes=vl,vr`;
+  const r = await fetch(url);
+  const text = await r.text();
+  res.status(r.status).type("text/plain").send(`URL: ${url}\nStatus: ${r.status}\n\n${text}`);
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`DiamondStats backend corriendo en puerto ${PORT}`));
 
