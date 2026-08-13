@@ -488,3 +488,46 @@ app.get("/api/team/:code/situational", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ---- GET /api/team/:code/bullpen ----
+// Calidad REAL del bullpen de un equipo — promedio de ERA y WHIP de sus
+// relevistas (no del abridor), ponderado por entradas lanzadas. Antes el
+// modelo solo evaluaba al abridor; esto agrega el resto del juego.
+app.get("/api/team/:code/bullpen", async (req, res) => {
+  const teamId = TEAM_IDS[req.params.code.toUpperCase()];
+  if (!teamId) return res.status(404).json({ error: "Código de equipo no reconocido" });
+
+  try {
+    const data = await cachedFetch(
+      `pitchers-${teamId}`, // reutiliza el mismo caché que /pitchers, mismos datos crudos
+      `${MLB_API}/teams/${teamId}/roster?rosterType=active&hydrate=person(stats(type=season,group=pitching))`
+    );
+    const relievers = data.roster
+      .filter((p) => p.position.abbreviation === "P")
+      .map((p) => {
+        const s = p.person.stats?.[0]?.splits?.[0]?.stat || {};
+        return {
+          g: s.gamesPlayed || 0, gs: s.gamesStarted || 0,
+          era: s.era != null ? parseFloat(s.era) : null,
+          whip: s.whip != null ? parseFloat(s.whip) : null,
+          ip: s.inningsPitched != null ? parseFloat(s.inningsPitched) : 0,
+        };
+      })
+      // Relevista = casi nunca abre juegos (permite alguna apertura de emergencia)
+      .filter((p) => p.g > 0 && p.gs / p.g < 0.3 && p.ip > 0 && p.era != null && p.whip != null);
+
+    const totalIP = relievers.reduce((sum, p) => sum + p.ip, 0);
+    const bullpenERA = totalIP > 0 ? relievers.reduce((sum, p) => sum + p.era * p.ip, 0) / totalIP : null;
+    const bullpenWHIP = totalIP > 0 ? relievers.reduce((sum, p) => sum + p.whip * p.ip, 0) / totalIP : null;
+
+    res.json({
+      updated: new Date().toISOString(),
+      relieverCount: relievers.length,
+      totalIP: Math.round(totalIP * 10) / 10,
+      bullpenERA: bullpenERA != null ? Math.round(bullpenERA * 100) / 100 : null,
+      bullpenWHIP: bullpenWHIP != null ? Math.round(bullpenWHIP * 100) / 100 : null,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
