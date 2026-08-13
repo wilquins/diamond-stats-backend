@@ -436,3 +436,45 @@ app.get("/api/weather/:code", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ---- GET /api/team/:code/situational ----
+// Récord REAL del equipo desglosado por día/noche y por día de la semana,
+// calculado a partir de su calendario completo de la temporada (no es un
+// dato inventado — se cuenta juego por juego, con el resultado real).
+app.get("/api/team/:code/situational", async (req, res) => {
+  const teamId = TEAM_IDS[req.params.code.toUpperCase()];
+  if (!teamId) return res.status(404).json({ error: "Código de equipo no reconocido" });
+
+  try {
+    const season = new Date().getFullYear();
+    const data = await cachedFetch(
+      `situational-${teamId}-${season}`,
+      `${MLB_API}/schedule?sportId=1&teamId=${teamId}&season=${season}&gameType=R&hydrate=team`,
+      60 * 60 * 1000 // 1 hora — el calendario/resultados no cambian a cada rato
+    );
+
+    const games = (data.dates || []).flatMap((d) => d.games).filter((g) => g.status?.abstractGameState === "Final");
+
+    const dayRecord = { w: 0, l: 0 };
+    const nightRecord = { w: 0, l: 0 };
+    const weekdayNames = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
+    const byWeekday = Object.fromEntries(weekdayNames.map((n) => [n, { w: 0, l: 0 }]));
+
+    for (const g of games) {
+      const isHome = g.teams.home.team.id === teamId;
+      const won = isHome ? g.teams.home.isWinner : g.teams.away.isWinner;
+      if (won == null) continue;
+      const bucket = won ? "w" : "l";
+
+      const isDay = g.dayNight === "day";
+      (isDay ? dayRecord : nightRecord)[bucket]++;
+
+      const weekday = weekdayNames[new Date(g.gameDate).getDay()];
+      byWeekday[weekday][bucket]++;
+    }
+
+    res.json({ updated: new Date().toISOString(), season, dayRecord, nightRecord, byWeekday });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
