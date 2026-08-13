@@ -367,6 +367,7 @@ app.get("/api/games/today", async (req, res) => {
         awayCode: TEAM_ID_TO_CODE[g.teams.away.team.id] || null,
         venue: g.venue?.name,
         time: g.gameDate,
+        dayNight: g.dayNight, // "day" | "night" — dato real de MLB, no calculado por nosotros
         status: g.status?.detailedState || null,
         homePitcher: await pitcherInfo(g.teams.home.probablePitcher),
         awayPitcher: await pitcherInfo(g.teams.away.probablePitcher),
