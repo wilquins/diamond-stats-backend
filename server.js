@@ -16,10 +16,23 @@ import cors from "cors";
 
 const app = express();
 app.use(cors()); // permite que tu frontend (en otro dominio) le pegue a este servidor
+app.use(express.json()); // para poder leer el body de las peticiones POST
 
 const MLB_API = "https://statsapi.mlb.com/api/v1";
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutos
 const cache = new Map();
+
+// ---- Conexión a Supabase (base de datos real de predicciones) ----
+// La llave "publishable"/anon está diseñada para usarse así, del lado del
+// servidor o del cliente — no es secreta, solo permite lo que las reglas
+// de la base de datos autoricen.
+const SUPABASE_URL = "https://apshtslmuynimzvxnmla.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFwc2h0c2xtdXluaW16dnhubWxhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY1Nzg5MjQsImV4cCI6MjEwMjE1NDkyNH0.3DWpv_GZsAxtx0-O8z90RuyfzlCT-YlxkxhIQZltoSA";
+const supabaseHeaders = {
+  apikey: SUPABASE_KEY,
+  Authorization: `Bearer ${SUPABASE_KEY}`,
+  "Content-Type": "application/json",
+};
 
 // IDs oficiales de los 30 equipos en la MLB Stats API
 const TEAM_IDS = {
@@ -526,6 +539,111 @@ app.get("/api/team/:code/bullpen", async (req, res) => {
       totalIP: Math.round(totalIP * 10) / 10,
       bullpenERA: bullpenERA != null ? Math.round(bullpenERA * 100) / 100 : null,
       bullpenWHIP: bullpenWHIP != null ? Math.round(bullpenWHIP * 100) / 100 : null,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- POST /api/predictions/save ----
+// Guarda la predicción real de un partido en la base de datos, para poder
+// compararla después contra el resultado real. Evita duplicados: si ya
+// existe una predicción guardada para ese partido y fecha, no la repite.
+app.post("/api/predictions/save", async (req, res) => {
+  const { game_date, home_code, away_code, home_win_prob } = req.body || {};
+  if (!game_date || !home_code || !away_code || home_win_prob == null) {
+    return res.status(400).json({ error: "Faltan datos requeridos" });
+  }
+  try {
+    const checkUrl = `${SUPABASE_URL}/rest/v1/predictions?game_date=eq.${game_date}&home_code=eq.${home_code}&away_code=eq.${away_code}&select=id`;
+    const existing = await fetch(checkUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    if (Array.isArray(existing) && existing.length > 0) {
+      return res.json({ saved: false, reason: "ya existía una predicción para este partido" });
+    }
+    const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/predictions`, {
+      method: "POST",
+      headers: { ...supabaseHeaders, Prefer: "return=representation" },
+      body: JSON.stringify([{ game_date, home_code, away_code, home_win_prob }]),
+    });
+    if (!insertRes.ok) throw new Error(`Supabase insert error ${insertRes.status}`);
+    res.json({ saved: true });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- POST /api/predictions/check ----
+// Revisa las predicciones de días anteriores que todavía no se compararon
+// contra el resultado real (checked_at es nulo), busca el resultado real
+// del partido en la MLB API, y guarda quién ganó de verdad.
+app.post("/api/predictions/check", async (req, res) => {
+  try {
+    const pendingUrl = `${SUPABASE_URL}/rest/v1/predictions?checked_at=is.null&game_date=lt.${new Date().toISOString().slice(0, 10)}&select=*`;
+    const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    let updated = 0;
+
+    for (const pred of pending) {
+      const data = await cachedFetch(
+        `results-${pred.game_date}`,
+        `${MLB_API}/schedule?sportId=1&date=${pred.game_date}`,
+        60 * 60 * 1000
+      );
+      const games = data.dates?.[0]?.games || [];
+      const match = games.find(
+        (g) =>
+          TEAM_ID_TO_CODE[g.teams.home.team.id] === pred.home_code &&
+          TEAM_ID_TO_CODE[g.teams.away.team.id] === pred.away_code &&
+          g.status?.abstractGameState === "Final"
+      );
+      if (!match) continue; // el juego todavía no terminó, o no se encontró — se revisa después
+
+      const winner = match.teams.home.isWinner ? pred.home_code : pred.away_code;
+      await fetch(`${SUPABASE_URL}/rest/v1/predictions?id=eq.${pred.id}`, {
+        method: "PATCH",
+        headers: supabaseHeaders,
+        body: JSON.stringify({ actual_winner: winner, checked_at: new Date().toISOString() }),
+      });
+      updated++;
+    }
+    res.json({ checked: pending.length, updated });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/predictions/accuracy ----
+// Calcula qué tan bien calibrado está el modelo, usando SOLO predicciones
+// ya comparadas contra el resultado real. Dos métricas:
+// - Precisión simple: de las veces que el modelo dio >50% a un equipo,
+//   ¿qué % de esas veces ganó de verdad ese equipo?
+// - Brier Score: la métrica estándar de calibración (más bajo = mejor;
+//   0 es predicción perfecta, 0.25 es "no mejor que adivinar al azar").
+app.get("/api/predictions/accuracy", async (req, res) => {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
+    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.json({ totalChecked: 0, accuracy: null, brierScore: null, recent: [] });
+    }
+
+    let correctFavorite = 0;
+    let brierSum = 0;
+    for (const row of rows) {
+      const predictedFavorite = row.home_win_prob >= 0.5 ? row.home_code : row.away_code;
+      if (predictedFavorite === row.actual_winner) correctFavorite++;
+
+      const actualHomeWon = row.actual_winner === row.home_code ? 1 : 0;
+      brierSum += Math.pow(row.home_win_prob - actualHomeWon, 2);
+    }
+
+    res.json({
+      totalChecked: rows.length,
+      accuracy: correctFavorite / rows.length,
+      brierScore: brierSum / rows.length,
+      recent: rows.slice(0, 15).map((r) => ({
+        date: r.game_date, home: r.home_code, away: r.away_code,
+        homeWinProb: r.home_win_prob, actualWinner: r.actual_winner,
+      })),
     });
   } catch (err) {
     res.status(502).json({ error: err.message });
