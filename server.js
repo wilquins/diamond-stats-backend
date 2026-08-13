@@ -193,8 +193,13 @@ async function fetchOneSplit(personId, sitCode) {
   }
 }
 async function fetchPlayerSplits(personId) {
-  const [vsL, vsR] = await Promise.all([fetchOneSplit(personId, "vl"), fetchOneSplit(personId, "vr")]);
-  return { vsL, vsR };
+  const [vsL, vsR, day, night] = await Promise.all([
+    fetchOneSplit(personId, "vl"),
+    fetchOneSplit(personId, "vr"),
+    fetchOneSplit(personId, "d"),
+    fetchOneSplit(personId, "n"),
+  ]);
+  return { vsL, vsR, vsDay: day, vsNight: night };
 }
 
 // El objeto "probablePitcher" que devuelve el calendario NO incluye su
@@ -241,7 +246,11 @@ app.get("/api/team/:code/hitters", async (req, res) => {
 
     // Trae el split real de cada bateador en paralelo (uno por jugador).
     const splitsResults = await Promise.all(rawHitters.map((p) => fetchPlayerSplits(p.id)));
-    const hitters = rawHitters.map((p, i) => ({ ...p, vsL: splitsResults[i].vsL, vsR: splitsResults[i].vsR }));
+    const hitters = rawHitters.map((p, i) => ({
+      ...p,
+      vsL: splitsResults[i].vsL, vsR: splitsResults[i].vsR,
+      vsDay: splitsResults[i].vsDay, vsNight: splitsResults[i].vsNight,
+    }));
 
     res.json({ updated: new Date().toISOString(), hitters });
   } catch (err) {
