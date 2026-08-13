@@ -22,6 +22,14 @@ const MLB_API = "https://statsapi.mlb.com/api/v1";
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutos
 const cache = new Map();
 
+// Calcula la fecha de "hoy" en la zona horaria del Este de EE.UU. (la que
+// usa MLB oficialmente para definir su calendario del día) — usar UTC
+// directo hacía que la app mostrara los juegos de MAÑANA cuando todavía
+// era de noche hoy en EE.UU., porque UTC ya había cruzado la medianoche.
+function todayET() {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
 // ---- Conexión a Supabase (base de datos real de predicciones) ----
 // La llave "publishable"/anon está diseñada para usarse así, del lado del
 // servidor o del cliente — no es secreta, solo permite lo que las reglas
@@ -309,7 +317,7 @@ app.get("/api/team/:code/pitchers", async (req, res) => {
 // resuelve el "próxima fase" que quedó pendiente en el prototipo: ya no
 // es el as de referencia, es quien de verdad lanza ese día.
 app.get("/api/probable-pitchers", async (req, res) => {
-  const date = req.query.date || new Date().toISOString().slice(0, 10);
+  const date = req.query.date || todayET();
   try {
     const data = await cachedFetch(
       `probables-${date}`,
@@ -354,7 +362,7 @@ app.listen(PORT, () => console.log(`DiamondStats backend corriendo en puerto ${P
 // pida), con el ID de juego (gamePk) que se necesita para pedir su
 // alineación después.
 app.get("/api/games/today", async (req, res) => {
-  const date = req.query.date || new Date().toISOString().slice(0, 10);
+  const date = req.query.date || todayET();
   try {
     const data = await cachedFetch(
       `games-today-${date}`,
@@ -578,7 +586,7 @@ app.post("/api/predictions/save", async (req, res) => {
 // del partido en la MLB API, y guarda quién ganó de verdad.
 app.post("/api/predictions/check", async (req, res) => {
   try {
-    const pendingUrl = `${SUPABASE_URL}/rest/v1/predictions?checked_at=is.null&game_date=lt.${new Date().toISOString().slice(0, 10)}&select=*`;
+    const pendingUrl = `${SUPABASE_URL}/rest/v1/predictions?checked_at=is.null&game_date=lt.${todayET()}&select=*`;
     const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
     let updated = 0;
 
