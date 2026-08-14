@@ -657,3 +657,32 @@ app.get("/api/predictions/accuracy", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ---- GET /api/player/:id/streak ----
+// Racha REAL de juegos consecutivos con al menos un hit, calculada del
+// historial real de juegos del jugador (no una estimación) — cuenta hacia
+// atrás desde su juego más reciente hasta encontrar uno sin hit.
+app.get("/api/player/:id/streak", async (req, res) => {
+  try {
+    const season = new Date().getFullYear();
+    const data = await cachedFetch(
+      `gamelog-${req.params.id}-${season}`,
+      `${MLB_API}/people/${req.params.id}/stats?stats=gameLog&group=hitting&season=${season}`,
+      60 * 60 * 1000 // 1 hora
+    );
+    const splits = data.stats?.[0]?.splits || [];
+    // El gameLog viene en orden cronológico ascendente — lo recorremos
+    // desde el más reciente (al final) hacia atrás.
+    let streak = 0;
+    for (let i = splits.length - 1; i >= 0; i--) {
+      const hits = splits[i].stat?.hits ?? 0;
+      const ab = splits[i].stat?.atBats ?? 0;
+      if (ab === 0) continue; // no jugó ese día (ej. relevo/descanso), no rompe la racha
+      if (hits > 0) streak++;
+      else break;
+    }
+    res.json({ streak });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
