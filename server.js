@@ -485,6 +485,10 @@ app.get("/api/team/:code/situational", async (req, res) => {
     );
 
     const games = (data.dates || []).flatMap((d) => d.games).filter((g) => g.status?.abstractGameState === "Final");
+    // Ordenamos por fecha real, del más viejo al más reciente — necesario
+    // para poder tomar los últimos 10 de verdad, sin depender de que la
+    // API ya los devuelva en ese orden.
+    games.sort((a, b) => new Date(a.gameDate) - new Date(b.gameDate));
 
     const dayRecord = { w: 0, l: 0 };
     const nightRecord = { w: 0, l: 0 };
@@ -504,7 +508,21 @@ app.get("/api/team/:code/situational", async (req, res) => {
       byWeekday[weekday][bucket]++;
     }
 
-    res.json({ updated: new Date().toISOString(), season, dayRecord, nightRecord, byWeekday });
+    // Récord real de los últimos 10 juegos — su "forma reciente", que
+    // puede ser muy distinta a su récord de toda la temporada.
+    const finishedGames = games.filter((g) => {
+      const isHome = g.teams.home.team.id === teamId;
+      return (isHome ? g.teams.home.isWinner : g.teams.away.isWinner) != null;
+    });
+    const lastTen = finishedGames.slice(-10);
+    const last10Record = { w: 0, l: 0 };
+    for (const g of lastTen) {
+      const isHome = g.teams.home.team.id === teamId;
+      const won = isHome ? g.teams.home.isWinner : g.teams.away.isWinner;
+      last10Record[won ? "w" : "l"]++;
+    }
+
+    res.json({ updated: new Date().toISOString(), season, dayRecord, nightRecord, byWeekday, last10Record });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
