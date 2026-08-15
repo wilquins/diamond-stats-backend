@@ -861,3 +861,54 @@ app.get("/api/picks/accuracy", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ---- GET /api/team/:code/rest?date=YYYY-MM-DD ----
+// Descanso REAL de un equipo antes de su juego de una fecha específica —
+// cuántos días de descanso tuvo, si el juego anterior fue de día o de
+// noche (para detectar el clásico "getaway day": jugar de noche y al
+// día siguiente de día, con poco descanso real), y si cambió de estadio
+// (señal de que viajaron, no solo que jugaron seguido en casa).
+app.get("/api/team/:code/rest", async (req, res) => {
+  const teamId = TEAM_IDS[req.params.code.toUpperCase()];
+  if (!teamId) return res.status(404).json({ error: "Código de equipo no reconocido" });
+  const targetDate = req.query.date || todayET();
+
+  try {
+    // Trae los últimos 6 días antes de la fecha objetivo, suficiente para
+    // encontrar el juego anterior real incluso si tuvieron 2-3 días libres.
+    const start = new Date(targetDate);
+    start.setDate(start.getDate() - 6);
+    const startStr = start.toISOString().slice(0, 10);
+    const endDate = new Date(targetDate);
+    endDate.setDate(endDate.getDate() - 1);
+    const endStr = endDate.toISOString().slice(0, 10);
+
+    const data = await cachedFetch(
+      `rest-${teamId}-${targetDate}`,
+      `${MLB_API}/schedule?sportId=1&teamId=${teamId}&startDate=${startStr}&endDate=${endStr}`,
+      60 * 60 * 1000
+    );
+    const games = (data.dates || [])
+      .flatMap((d) => d.games)
+      .filter((g) => g.status?.abstractGameState === "Final")
+      .sort((a, b) => new Date(a.gameDate) - new Date(b.gameDate));
+
+    if (games.length === 0) {
+      return res.json({ daysRested: null, lastGameDayNight: null, sameVenue: null, note: "Sin juegos recientes encontrados (posible inicio de temporada o descanso largo)" });
+    }
+
+    const lastGame = games[games.length - 1];
+    const lastGameDate = new Date(lastGame.gameDate).toISOString().slice(0, 10);
+    const daysRested = Math.round((new Date(targetDate) - new Date(lastGameDate)) / (1000 * 60 * 60 * 24)) - 1;
+    const isHome = lastGame.teams.home.team.id === teamId;
+
+    res.json({
+      daysRested: Math.max(0, daysRested), // 0 = jugaron ayer (back-to-back), 1 = tuvieron 1 día libre, etc.
+      lastGameDayNight: lastGame.dayNight,
+      lastGameVenue: lastGame.venue?.name || null,
+      lastGameWasHome: isHome,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
