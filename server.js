@@ -740,3 +740,124 @@ app.get("/api/matchup/:homeCode/:awayCode/headtohead", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ---- POST /api/picks/save ----
+// Guarda los picks del día (bateadores y equipos) en la base de datos,
+// para poder comparar después contra lo que de verdad pasó. Evita
+// duplicados: si ya existe un pick guardado para esa fecha/tipo/nombre,
+// no lo repite.
+app.post("/api/picks/save", async (req, res) => {
+  const picks = req.body?.picks;
+  if (!Array.isArray(picks) || picks.length === 0) {
+    return res.status(400).json({ error: "Se esperaba un arreglo 'picks'" });
+  }
+  try {
+    let saved = 0;
+    for (const p of picks) {
+      const { pick_date, pick_type, player_id, player_name, team_code, predicted_prob } = p;
+      if (!pick_date || !pick_type || !player_name || !team_code || predicted_prob == null) continue;
+
+      const checkUrl = `${SUPABASE_URL}/rest/v1/daily_picks?pick_date=eq.${pick_date}&pick_type=eq.${pick_type}&player_name=eq.${encodeURIComponent(player_name)}&select=id`;
+      const existing = await fetch(checkUrl, { headers: supabaseHeaders }).then((r) => r.json());
+      if (Array.isArray(existing) && existing.length > 0) continue;
+
+      const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/daily_picks`, {
+        method: "POST",
+        headers: { ...supabaseHeaders, Prefer: "return=representation" },
+        body: JSON.stringify([{ pick_date, pick_type, player_id: player_id || null, player_name, team_code, predicted_prob }]),
+      });
+      if (insertRes.ok) saved++;
+    }
+    res.json({ saved });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- POST /api/picks/check ----
+// Revisa los picks de días anteriores que todavía no se compararon, y
+// busca el resultado REAL: para bateadores, si consiguió al menos un hit
+// ese día específico; para equipos, si ganaron ese día específico.
+app.post("/api/picks/check", async (req, res) => {
+  try {
+    const today = todayET();
+    const pendingUrl = `${SUPABASE_URL}/rest/v1/daily_picks?checked_at=is.null&pick_date=lt.${today}&select=*`;
+    const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    let updated = 0;
+
+    for (const pick of pending) {
+      let success = null;
+
+      if (pick.pick_type === "batter" && pick.player_id) {
+        try {
+          const season = new Date(pick.pick_date).getFullYear();
+          const data = await cachedFetch(
+            `gamelog-${pick.player_id}-${season}`,
+            `${MLB_API}/people/${pick.player_id}/stats?stats=gameLog&group=hitting&season=${season}`,
+            60 * 60 * 1000
+          );
+          const splits = data.stats?.[0]?.splits || [];
+          const gameThatDay = splits.find((s) => s.date === pick.pick_date);
+          if (gameThatDay) success = (gameThatDay.stat?.hits ?? 0) > 0;
+        } catch { /* se revisa en otra ronda */ }
+      } else if (pick.pick_type === "team") {
+        try {
+          const teamId = TEAM_IDS[pick.team_code];
+          if (teamId) {
+            const data = await cachedFetch(
+              `schedule-day-${teamId}-${pick.pick_date}`,
+              `${MLB_API}/schedule?sportId=1&teamId=${teamId}&date=${pick.pick_date}`,
+              60 * 60 * 1000
+            );
+            const game = (data.dates?.[0]?.games || []).find((g) => g.status?.abstractGameState === "Final");
+            if (game) {
+              const isHome = game.teams.home.team.id === teamId;
+              success = isHome ? game.teams.home.isWinner : game.teams.away.isWinner;
+            }
+          }
+        } catch { /* se revisa en otra ronda */ }
+      }
+
+      if (success == null) continue; // aún no hay resultado real, se deja pendiente
+      await fetch(`${SUPABASE_URL}/rest/v1/daily_picks?id=eq.${pick.id}`, {
+        method: "PATCH",
+        headers: supabaseHeaders,
+        body: JSON.stringify({ actual_success: success, checked_at: new Date().toISOString() }),
+      });
+      updated++;
+    }
+    res.json({ checked: pending.length, updated });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/picks/accuracy ----
+// Precisión real de los Picks del día, separada entre bateadores y
+// equipos — de las veces que la app dijo "este bateador va a dar hit" o
+// "este equipo va a ganar", ¿qué tan seguido pasó de verdad?
+app.get("/api/picks/accuracy", async (req, res) => {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/daily_picks?checked_at=not.is.null&select=*&order=pick_date.desc`;
+    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(rows)) throw new Error("Respuesta inesperada de Supabase");
+
+    const summarize = (type) => {
+      const filtered = rows.filter((r) => r.pick_type === type);
+      if (filtered.length === 0) return { total: 0, accuracy: null };
+      const successes = filtered.filter((r) => r.actual_success === true).length;
+      return { total: filtered.length, accuracy: successes / filtered.length };
+    };
+
+    res.json({
+      batters: summarize("batter"),
+      teams: summarize("team"),
+      recent: rows.slice(0, 20).map((r) => ({
+        date: r.pick_date, type: r.pick_type, name: r.player_name, team: r.team_code,
+        prob: r.predicted_prob, success: r.actual_success,
+      })),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
