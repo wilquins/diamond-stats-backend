@@ -704,3 +704,39 @@ app.get("/api/player/:id/streak", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ---- GET /api/matchup/:homeCode/:awayCode/headtohead ----
+// Récord REAL de enfrentamientos entre estos dos equipos específicos, esta
+// temporada — no es un promedio genérico, es cómo les ha ido de verdad el
+// uno contra el otro.
+app.get("/api/matchup/:homeCode/:awayCode/headtohead", async (req, res) => {
+  const homeId = TEAM_IDS[req.params.homeCode.toUpperCase()];
+  const awayId = TEAM_IDS[req.params.awayCode.toUpperCase()];
+  if (!homeId || !awayId) return res.status(404).json({ error: "Código de equipo no reconocido" });
+
+  try {
+    const season = new Date().getFullYear();
+    const data = await cachedFetch(
+      `schedule-${homeId}-${season}`,
+      `${MLB_API}/schedule?sportId=1&teamId=${homeId}&season=${season}&gameType=R&hydrate=team`,
+      60 * 60 * 1000 // 1 hora
+    );
+    const games = (data.dates || [])
+      .flatMap((d) => d.games)
+      .filter((g) => g.status?.abstractGameState === "Final")
+      .filter((g) => g.teams.home.team.id === awayId || g.teams.away.team.id === awayId);
+
+    const record = { homeTeamWins: 0, awayTeamWins: 0 };
+    for (const g of games) {
+      const homeTeamIsHomeInThisGame = g.teams.home.team.id === homeId;
+      const homeTeamWon = homeTeamIsHomeInThisGame ? g.teams.home.isWinner : g.teams.away.isWinner;
+      if (homeTeamWon == null) continue;
+      if (homeTeamWon) record.homeTeamWins++;
+      else record.awayTeamWins++;
+    }
+
+    res.json({ updated: new Date().toISOString(), season, gamesPlayed: games.length, ...record });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
