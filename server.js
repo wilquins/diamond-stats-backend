@@ -235,6 +235,24 @@ async function fetchPitcherHand(personId) {
   }
 }
 
+// El hydrate anidado "probablePitcher(stats(...))" NO funciona de verdad
+// — la respuesta de la MLB API no trae stats adentro, aunque se lo
+// pidamos (confirmado con un diagnóstico real). Igual que con la mano,
+// la solución real es una llamada separada y dedicada por pitcher.
+async function fetchPitcherEra(personId) {
+  try {
+    const season = new Date().getFullYear();
+    const data = await cachedFetch(
+      `era-${personId}-${season}`,
+      `${MLB_API}/people/${personId}/stats?stats=season&group=pitching&season=${season}`
+    );
+    const stat = data.stats?.[0]?.splits?.[0]?.stat;
+    return stat?.era != null ? parseFloat(stat.era) : null;
+  } catch {
+    return null;
+  }
+}
+
 // Bateadores reales de un equipo con sus stats actuales de temporada.
 app.get("/api/team/:code/hitters", async (req, res) => {
   const teamId = TEAM_IDS[req.params.code.toUpperCase()];
@@ -321,17 +339,15 @@ app.get("/api/probable-pitchers", async (req, res) => {
   try {
     const data = await cachedFetch(
       `probables-${date}`,
-      `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher(stats(type=season,group=pitching))`
+      `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher`
     );
     const pitcherInfo = async (p) => {
       if (!p) return { name: "Por confirmar", hand: null, era: null };
-      const s = p.stats?.find((st) => st.group?.displayName === "pitching")?.splits?.[0]?.stat;
-      const hand = p.pitchHand?.code || (p.id ? await fetchPitcherHand(p.id) : null);
-      return {
-        name: p.fullName,
-        hand,
-        era: s?.era != null ? parseFloat(s.era) : null,
-      };
+      const [hand, era] = await Promise.all([
+        p.pitchHand?.code ? Promise.resolve(p.pitchHand.code) : (p.id ? fetchPitcherHand(p.id) : Promise.resolve(null)),
+        p.id ? fetchPitcherEra(p.id) : Promise.resolve(null),
+      ]);
+      return { name: p.fullName, hand, era };
     };
     const rawGames = data.dates?.[0]?.games || [];
     const games = await Promise.all(
@@ -366,17 +382,15 @@ app.get("/api/games/today", async (req, res) => {
   try {
     const data = await cachedFetch(
       `games-today-${date}`,
-      `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher(stats(type=season,group=pitching))`
+      `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher`
     );
     const pitcherInfo = async (p) => {
       if (!p) return { name: "Por confirmar", hand: null, era: null };
-      const s = p.stats?.find((st) => st.group?.displayName === "pitching")?.splits?.[0]?.stat;
-      const hand = p.pitchHand?.code || (p.id ? await fetchPitcherHand(p.id) : null);
-      return {
-        name: p.fullName,
-        hand,
-        era: s?.era != null ? parseFloat(s.era) : null,
-      };
+      const [hand, era] = await Promise.all([
+        p.pitchHand?.code ? Promise.resolve(p.pitchHand.code) : (p.id ? fetchPitcherHand(p.id) : Promise.resolve(null)),
+        p.id ? fetchPitcherEra(p.id) : Promise.resolve(null),
+      ]);
+      return { name: p.fullName, hand, era };
     };
     const rawGames = data.dates?.[0]?.games || [];
     const games = await Promise.all(
@@ -937,14 +951,3 @@ app.get("/api/team/:code/rest", async (req, res) => {
   }
 });
 
-// ---- TEMPORAL: GET /api/debug/raw-schedule ----
-// Solo para diagnosticar por qué el ERA de los abridores probables sale
-// null — muestra la respuesta CRUDA de la MLB API, sin que nuestro
-// código la procese. Se puede borrar una vez resuelto.
-app.get("/api/debug/raw-schedule", async (req, res) => {
-  const date = req.query.date || todayET();
-  const url = `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher(stats(type=season,group=pitching))`;
-  const r = await fetch(url);
-  const text = await r.text();
-  res.status(r.status).type("application/json").send(text);
-});
