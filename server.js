@@ -936,3 +936,15 @@ app.get("/api/team/:code/rest", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ---- TEMPORAL: GET /api/debug/raw-schedule ----
+// Solo para diagnosticar por qué el ERA de los abridores probables sale
+// null — muestra la respuesta CRUDA de la MLB API, sin que nuestro
+// código la procese. Se puede borrar una vez resuelto.
+app.get("/api/debug/raw-schedule", async (req, res) => {
+  const date = req.query.date || todayET();
+  const url = `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher(stats(type=season,group=pitching))`;
+  const r = await fetch(url);
+  const text = await r.text();
+  res.status(r.status).type("application/json").send(text);
+});
