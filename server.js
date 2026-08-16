@@ -718,7 +718,7 @@ app.get("/api/matchup/:homeCode/:awayCode/headtohead", async (req, res) => {
     const season = new Date().getFullYear();
     const data = await cachedFetch(
       `schedule-${homeId}-${season}`,
-      `${MLB_API}/schedule?sportId=1&teamId=${homeId}&season=${season}&gameType=R&hydrate=team`,
+      `${MLB_API}/schedule?sportId=1&teamId=${homeId}&season=${season}&gameType=R&hydrate=team,linescore`,
       60 * 60 * 1000 // 1 hora
     );
     const games = (data.dates || [])
@@ -727,15 +727,39 @@ app.get("/api/matchup/:homeCode/:awayCode/headtohead", async (req, res) => {
       .filter((g) => g.teams.home.team.id === awayId || g.teams.away.team.id === awayId);
 
     const record = { homeTeamWins: 0, awayTeamWins: 0 };
+    // Línea de referencia fija (~8.5), basada en el promedio real de
+    // carreras combinadas de MLB esta temporada — la misma que usa el
+    // modelo de Over/Under de cada partido.
+    const REFERENCE_LINE = 8.5;
+    let overCount = 0, underCount = 0, totalRunsSum = 0, scoredGames = 0;
+
     for (const g of games) {
       const homeTeamIsHomeInThisGame = g.teams.home.team.id === homeId;
       const homeTeamWon = homeTeamIsHomeInThisGame ? g.teams.home.isWinner : g.teams.away.isWinner;
-      if (homeTeamWon == null) continue;
-      if (homeTeamWon) record.homeTeamWins++;
-      else record.awayTeamWins++;
+      if (homeTeamWon != null) {
+        if (homeTeamWon) record.homeTeamWins++;
+        else record.awayTeamWins++;
+      }
+
+      const homeScore = g.teams.home.score;
+      const awayScore = g.teams.away.score;
+      if (homeScore != null && awayScore != null) {
+        const total = homeScore + awayScore;
+        totalRunsSum += total;
+        scoredGames++;
+        if (total > REFERENCE_LINE) overCount++;
+        else underCount++;
+      }
     }
 
-    res.json({ updated: new Date().toISOString(), season, gamesPlayed: games.length, ...record });
+    res.json({
+      updated: new Date().toISOString(), season, gamesPlayed: games.length, ...record,
+      overUnder: {
+        referenceLine: REFERENCE_LINE,
+        overCount, underCount,
+        avgTotalRuns: scoredGames > 0 ? Math.round((totalRunsSum / scoredGames) * 100) / 100 : null,
+      },
+    });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
