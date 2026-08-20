@@ -791,38 +791,22 @@ app.post("/api/picks/save", async (req, res) => {
   }
   try {
     let saved = 0;
-    const debugLog = [];
     for (const p of picks) {
       const { pick_date, pick_type, player_id, player_name, team_code, predicted_prob } = p;
-      if (!pick_date || !pick_type || !player_name || !team_code || predicted_prob == null) {
-        debugLog.push(`SALTADO (datos incompletos): ${player_name || "?"}`);
-        continue;
-      }
+      if (!pick_date || !pick_type || !player_name || !team_code || predicted_prob == null) continue;
 
       const checkUrl = `${SUPABASE_URL}/rest/v1/daily_picks?pick_date=eq.${pick_date}&pick_type=eq.${pick_type}&player_name=eq.${encodeURIComponent(player_name)}&select=id`;
       const existing = await fetch(checkUrl, { headers: supabaseHeaders }).then((r) => r.json());
-      if (Array.isArray(existing) && existing.length > 0) {
-        debugLog.push(`SALTADO (ya existía): ${player_name}`);
-        continue;
-      }
-      if (!Array.isArray(existing)) {
-        debugLog.push(`ADVERTENCIA (check no devolvió array) para ${player_name}: ${JSON.stringify(existing)}`);
-      }
+      if (Array.isArray(existing) && existing.length > 0) continue;
 
       const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/daily_picks`, {
         method: "POST",
         headers: { ...supabaseHeaders, Prefer: "return=representation" },
         body: JSON.stringify([{ pick_date, pick_type, player_id: player_id || null, player_name, team_code, predicted_prob }]),
       });
-      if (insertRes.ok) {
-        saved++;
-        debugLog.push(`GUARDADO: ${player_name}`);
-      } else {
-        const errorText = await insertRes.text();
-        debugLog.push(`FALLÓ insert (status ${insertRes.status}) para ${player_name}: ${errorText}`);
-      }
+      if (insertRes.ok) saved++;
     }
-    res.json({ saved, debugLog });
+    res.json({ saved });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
