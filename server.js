@@ -536,7 +536,26 @@ app.get("/api/team/:code/situational", async (req, res) => {
       last10Record[won ? "w" : "l"]++;
     }
 
-    res.json({ updated: new Date().toISOString(), season, dayRecord, nightRecord, byWeekday, last10Record });
+    // Racha REAL actual — juegos consecutivos ganando o perdiendo, desde
+    // el más reciente hacia atrás. Es distinto al récord de últimos 10:
+    // un equipo puede ir 6-4 en sus últimos 10, pero venir de ganar los
+    // últimos 3 seguidos (una racha real, con más peso que un promedio).
+    let currentStreak = { type: null, count: 0 };
+    for (let i = finishedGames.length - 1; i >= 0; i--) {
+      const g = finishedGames[i];
+      const isHome = g.teams.home.team.id === teamId;
+      const won = isHome ? g.teams.home.isWinner : g.teams.away.isWinner;
+      const type = won ? "W" : "L";
+      if (currentStreak.type === null) {
+        currentStreak = { type, count: 1 };
+      } else if (currentStreak.type === type) {
+        currentStreak.count++;
+      } else {
+        break;
+      }
+    }
+
+    res.json({ updated: new Date().toISOString(), season, dayRecord, nightRecord, byWeekday, last10Record, currentStreak });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -705,15 +724,32 @@ app.get("/api/player/:id/streak", async (req, res) => {
     const splits = data.stats?.[0]?.splits || [];
     // El gameLog viene en orden cronológico ascendente — lo recorremos
     // desde el más reciente (al final) hacia atrás.
-    let streak = 0;
+    let hitStreak = 0;
+    let coldStreak = 0;
     for (let i = splits.length - 1; i >= 0; i--) {
       const hits = splits[i].stat?.hits ?? 0;
       const ab = splits[i].stat?.atBats ?? 0;
       if (ab === 0) continue; // no jugó ese día (ej. relevo/descanso), no rompe la racha
-      if (hits > 0) streak++;
-      else break;
+      if (hits > 0) {
+        if (coldStreak > 0) break; // ya veníamos contando fría, esta rompe esa cuenta
+        hitStreak++;
+      } else {
+        if (hitStreak > 0) break; // ya veníamos contando caliente, esta rompe esa cuenta
+        coldStreak++;
+      }
     }
-    res.json({ streak });
+
+    // Promedio de bateo REAL de los últimos 10 juegos jugados (no
+    // calendario) — la forma reciente, distinta del promedio de toda la
+    // temporada. Usa los mismos datos del gameLog que ya se cargaron.
+    const gamesWithAtBats = splits.filter((s) => (s.stat?.atBats ?? 0) > 0);
+    const recentGames = gamesWithAtBats.slice(-10);
+    const recentAtBats = recentGames.reduce((sum, s) => sum + (s.stat?.atBats ?? 0), 0);
+    const recentHits = recentGames.reduce((sum, s) => sum + (s.stat?.hits ?? 0), 0);
+    const recentAvg = recentAtBats > 0 ? recentHits / recentAtBats : null;
+    const recentGamesPlayed = recentGames.length;
+
+    res.json({ streak: hitStreak, hitStreak, coldStreak, recentAvg, recentGames: recentGamesPlayed });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
