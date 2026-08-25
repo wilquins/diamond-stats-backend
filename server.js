@@ -682,7 +682,7 @@ app.get("/api/predictions/accuracy", async (req, res) => {
     const url = `${SUPABASE_URL}/rest/v1/predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
     const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
     if (!Array.isArray(rows) || rows.length === 0) {
-      return res.json({ totalChecked: 0, accuracy: null, brierScore: null, recent: [] });
+      return res.json({ totalChecked: 0, accuracy: null, brierScore: null, recent: [], calibration: [] });
     }
 
     let correctFavorite = 0;
@@ -695,10 +695,46 @@ app.get("/api/predictions/accuracy", async (req, res) => {
       brierSum += Math.pow(row.home_win_prob - actualHomeWon, 2);
     }
 
+    // ---- Calibración real por rangos de confianza ----
+    // Para cada predicción, la probabilidad del FAVORITO (no siempre el
+    // local) — así podemos ver: de todas las veces que el modelo dijo
+    // "70-80% de confianza", ¿ganó el favorito real ese % de las veces?
+    // Si el % real es MENOR al rango, el modelo está sobreconfiado ahí.
+    // Si es MAYOR, está subconfiado (podría haber dado más confianza).
+    const buckets = [
+      { label: "50-60%", min: 0.5, max: 0.6 },
+      { label: "60-70%", min: 0.6, max: 0.7 },
+      { label: "70-80%", min: 0.7, max: 0.8 },
+      { label: "80-90%", min: 0.8, max: 0.9 },
+      { label: "90%+", min: 0.9, max: 1.01 },
+    ];
+    const calibration = buckets.map(({ label, min, max }) => {
+      const inBucket = rows.filter((r) => {
+        const favProb = r.home_win_prob >= 0.5 ? r.home_win_prob : 1 - r.home_win_prob;
+        return favProb >= min && favProb < max;
+      });
+      if (inBucket.length === 0) return { label, count: 0, predictedAvg: null, actualRate: null };
+      let favWon = 0;
+      let probSum = 0;
+      for (const r of inBucket) {
+        const favProb = r.home_win_prob >= 0.5 ? r.home_win_prob : 1 - r.home_win_prob;
+        const favorite = r.home_win_prob >= 0.5 ? r.home_code : r.away_code;
+        probSum += favProb;
+        if (r.actual_winner === favorite) favWon++;
+      }
+      return {
+        label,
+        count: inBucket.length,
+        predictedAvg: probSum / inBucket.length,
+        actualRate: favWon / inBucket.length,
+      };
+    });
+
     res.json({
       totalChecked: rows.length,
       accuracy: correctFavorite / rows.length,
       brierScore: brierSum / rows.length,
+      calibration,
       recent: rows.slice(0, 15).map((r) => ({
         date: r.game_date, home: r.home_code, away: r.away_code,
         homeWinProb: r.home_win_prob, actualWinner: r.actual_winner,
