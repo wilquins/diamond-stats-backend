@@ -679,7 +679,13 @@ app.post("/api/predictions/check", async (req, res) => {
 //   0 es predicción perfecta, 0.25 es "no mejor que adivinar al azar").
 app.get("/api/predictions/accuracy", async (req, res) => {
   try {
-    const url = `${SUPABASE_URL}/rest/v1/predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
+    // Parámetro opcional ?since=YYYY-MM-DD — filtra solo predicciones de
+    // esa fecha en adelante. Útil para comparar "todo el historial" vs.
+    // "solo desde que se aplicó la corrección de calibración", sin mezclar
+    // datos viejos (sin corregir) con nuevos en el mismo promedio.
+    const since = req.query.since;
+    const sinceFilter = since ? `&game_date=gte.${since}` : "";
+    const url = `${SUPABASE_URL}/rest/v1/predictions?checked_at=not.is.null${sinceFilter}&select=*&order=game_date.desc`;
     const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
     if (!Array.isArray(rows) || rows.length === 0) {
       return res.json({ totalChecked: 0, accuracy: null, brierScore: null, recent: [], calibration: [] });
