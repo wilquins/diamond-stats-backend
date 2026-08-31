@@ -100,24 +100,51 @@ function compassToDeg(label) {
 // gratis, sin llave, y sin el problema de límites por IP compartida que
 // tiene Open-Meteo en hosting gratuito). Solo cubre EE.UU. — Toronto usa
 // Open-Meteo como respaldo, siendo el único equipo fuera de EE.UU.
-async function fetchWeatherNWS(lat, lon, cacheKey) {
-  const hit = cache.get(cacheKey);
-  if (hit && Date.now() - hit.time < WEATHER_CACHE_TTL_MS) return hit.data;
+async function fetchWeatherNWS(lat, lon, cacheKey, gameTimeISO) {
+  // Cacheamos el pronóstico CRUDO completo (todas las horas), no el
+  // resultado ya elegido — así, sin importar qué hora de juego pida cada
+  // llamada, siempre se calcula fresco cuál período le corresponde,
+  // incluso si dos juegos distintos en el mismo estadio (doble cartelera)
+  // piden horas distintas el mismo rato.
+  const rawCacheKey = `${cacheKey}-raw`;
+  let forecast = cache.get(rawCacheKey)?.data;
+  if (!forecast || Date.now() - cache.get(rawCacheKey).time >= WEATHER_CACHE_TTL_MS) {
+    const headers = { "User-Agent": "DiamondStatsApp (proyecto personal de estadisticas MLB)" };
+    const pointsUrl = `https://api.weather.gov/points/${lat},${lon}`;
+    const pointsRes = await fetch(pointsUrl, { headers });
+    if (!pointsRes.ok) throw new Error(`Error ${pointsRes.status} consultando ${pointsUrl}`);
+    const points = await pointsRes.json();
+    const hourlyUrl = points.properties.forecastHourly;
 
-  const headers = { "User-Agent": "DiamondStatsApp (proyecto personal de estadisticas MLB)" };
-  const pointsUrl = `https://api.weather.gov/points/${lat},${lon}`;
-  const pointsRes = await fetch(pointsUrl, { headers });
-  if (!pointsRes.ok) throw new Error(`Error ${pointsRes.status} consultando ${pointsUrl}`);
-  const points = await pointsRes.json();
-  const hourlyUrl = points.properties.forecastHourly;
+    const forecastRes = await fetch(hourlyUrl, { headers });
+    if (!forecastRes.ok) throw new Error(`Error ${forecastRes.status} consultando ${hourlyUrl}`);
+    forecast = await forecastRes.json();
+    cache.set(rawCacheKey, { data: forecast, time: Date.now() });
+  }
 
-  const forecastRes = await fetch(hourlyUrl, { headers });
-  if (!forecastRes.ok) throw new Error(`Error ${forecastRes.status} consultando ${hourlyUrl}`);
-  const forecast = await forecastRes.json();
-  const now = forecast.properties.periods[0];
+  // Si nos dan la hora real del primer lanzamiento, buscamos el período
+  // del pronóstico por hora más cercano a ESA hora — no solo "ahora
+  // mismo". Esto importa de verdad para juegos que empiezan varias horas
+  // después de que se consulta el clima (ej. juego nocturno consultado
+  // en la tarde).
+  let period = forecast.properties.periods[0];
+  if (gameTimeISO) {
+    const gameTime = new Date(gameTimeISO).getTime();
+    let closest = period;
+    let closestDiff = Math.abs(new Date(period.startTime).getTime() - gameTime);
+    for (const p of forecast.properties.periods) {
+      const diff = Math.abs(new Date(p.startTime).getTime() - gameTime);
+      if (diff < closestDiff) {
+        closest = p;
+        closestDiff = diff;
+      }
+    }
+    period = closest;
+  }
+  const now = period;
 
   const windMph = parseFloat(now.windSpeed) || 0; // viene como texto "10 mph"
-  const data = {
+  return {
     tempF: now.temperature,
     humidity: now.relativeHumidity?.value ?? null,
     windMph,
@@ -126,9 +153,8 @@ async function fetchWeatherNWS(lat, lon, cacheKey) {
     pop: now.probabilityOfPrecipitation?.value ?? 0,
     description: now.shortForecast,
     icon: iconForForecast(now.shortForecast),
+    forecastFor: now.startTime, // hora real a la que corresponde este pronóstico, para mostrarlo honestamente
   };
-  cache.set(cacheKey, { data, time: Date.now() });
-  return data;
 }
 
 // Traduce la descripción corta del NWS a un ícono simple.
@@ -459,22 +485,35 @@ app.get("/api/weather/:code", async (req, res) => {
   const code = req.params.code.toUpperCase();
   const coords = STADIUM_COORDS[code];
   if (!coords) return res.status(404).json({ error: "Código de equipo no reconocido" });
+  const gameTime = req.query.gameTime || null; // ISO real del primer lanzamiento, si se conoce
 
   try {
     let data;
     if (code === "TOR") {
       // Único equipo fuera de EE.UU. — el NWS no cubre Canadá, usa Open-Meteo.
-      const url = `https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation_probability,weather_code&temperature_unit=fahrenheit&wind_speed_unit=mph`;
+      // Pide el pronóstico POR HORA (no solo "ahora") para poder elegir la
+      // hora real del juego, igual que hacemos con NWS.
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation_probability,weather_code&temperature_unit=fahrenheit&wind_speed_unit=mph&forecast_days=2`;
       const raw = await cachedFetch(`weather-${code}`, url, WEATHER_CACHE_TTL_MS);
-      const c = raw.current;
-      const w = describeWeatherCode(c.weather_code);
+      const times = raw.hourly.time;
+      let idx = 0;
+      if (gameTime) {
+        const gameMs = new Date(gameTime).getTime();
+        let closestDiff = Infinity;
+        times.forEach((t, i) => {
+          const diff = Math.abs(new Date(t).getTime() - gameMs);
+          if (diff < closestDiff) { closestDiff = diff; idx = i; }
+        });
+      }
+      const w = describeWeatherCode(raw.hourly.weather_code[idx]);
       data = {
-        tempF: c.temperature_2m, humidity: c.relative_humidity_2m, windMph: c.wind_speed_10m,
-        windDir: windDirectionLabel(c.wind_direction_10m), windDirDeg: c.wind_direction_10m,
-        pop: c.precipitation_probability, description: w.desc, icon: w.icon,
+        tempF: raw.hourly.temperature_2m[idx], humidity: raw.hourly.relative_humidity_2m[idx], windMph: raw.hourly.wind_speed_10m[idx],
+        windDir: windDirectionLabel(raw.hourly.wind_direction_10m[idx]), windDirDeg: raw.hourly.wind_direction_10m[idx],
+        pop: raw.hourly.precipitation_probability[idx], description: w.desc, icon: w.icon,
+        forecastFor: times[idx],
       };
     } else {
-      data = await fetchWeatherNWS(coords.lat, coords.lon, `weather-${code}`);
+      data = await fetchWeatherNWS(coords.lat, coords.lon, `weather-${code}`, gameTime);
     }
     res.json({ updated: new Date().toISOString(), ...data });
   } catch (err) {
