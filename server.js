@@ -824,6 +824,7 @@ app.get("/api/matchup/:homeCode/:awayCode/headtohead", async (req, res) => {
     // modelo de Over/Under de cada partido.
     const REFERENCE_LINE = 8.5;
     let overCount = 0, underCount = 0, totalRunsSum = 0, scoredGames = 0;
+    const gameDetails = [];
 
     for (const g of games) {
       const homeTeamIsHomeInThisGame = g.teams.home.team.id === homeId;
@@ -842,10 +843,30 @@ app.get("/api/matchup/:homeCode/:awayCode/headtohead", async (req, res) => {
         if (total > REFERENCE_LINE) overCount++;
         else underCount++;
       }
+
+      // Abridores reales de ESE juego específico — vía boxscore, cacheado
+      // igual que todo lo demás, para no golpear la MLB API de más.
+      let homeStarter = null, awayStarter = null;
+      try {
+        const box = await cachedFetch(`boxscore-${g.gamePk}`, `${MLB_API}/game/${g.gamePk}/boxscore`, 24 * 60 * 60 * 1000);
+        const homePitcherId = box.teams?.home?.pitchers?.[0];
+        const awayPitcherId = box.teams?.away?.pitchers?.[0];
+        homeStarter = homePitcherId ? box.teams.home.players?.[`ID${homePitcherId}`]?.person?.fullName || null : null;
+        awayStarter = awayPitcherId ? box.teams.away.players?.[`ID${awayPitcherId}`]?.person?.fullName || null : null;
+      } catch { /* si falla el boxscore de un juego viejo, seguimos sin sus abridores */ }
+
+      gameDetails.push({
+        date: g.gameDate?.slice(0, 10) || null,
+        homeCode: TEAM_ID_TO_CODE[g.teams.home.team.id] || null,
+        awayCode: TEAM_ID_TO_CODE[g.teams.away.team.id] || null,
+        homeScore, awayScore,
+        homeStarter, awayStarter,
+      });
     }
 
     res.json({
       updated: new Date().toISOString(), season, gamesPlayed: games.length, ...record,
+      games: gameDetails,
       overUnder: {
         referenceLine: REFERENCE_LINE,
         overCount, underCount,
