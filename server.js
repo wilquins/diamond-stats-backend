@@ -1276,6 +1276,7 @@ app.get("/api/nfl/standings", async (req, res) => {
       for (const entry of conf.standings?.entries || []) {
         const statByType = Object.fromEntries((entry.stats || []).map((s) => [s.type, s]));
         teams.push({
+          id: entry.team.id,
           code: entry.team.abbreviation,
           name: entry.team.displayName,
           wins: statByType.wins?.value ?? 0,
@@ -1291,6 +1292,39 @@ app.get("/api/nfl/standings", async (req, res) => {
     }
     teams.sort((a, b) => b.winPercent - a.winPercent);
     res.json({ teams });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nfl/team/:teamId/injuries ----
+// Estado real de lesiones del roster completo de un equipo — el roster
+// de ESPN ya trae el estado de cada jugador lesionado directo (sin
+// tener que saltar entre varias páginas). Se ordena con los QB primero,
+// porque es la posición que más cambia una predicción.
+app.get("/api/nfl/team/:teamId/injuries", async (req, res) => {
+  const { teamId } = req.params;
+  try {
+    const data = await cachedFetch(
+      `nfl-roster-${teamId}`,
+      `https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${teamId}/roster`,
+      30 * 60 * 1000
+    );
+    const injured = [];
+    for (const group of data.athletes || []) {
+      for (const p of group.items || []) {
+        if (p.injuries && p.injuries.length > 0) {
+          injured.push({
+            name: p.fullName,
+            position: p.position?.abbreviation || "?",
+            status: p.injuries[0].status,
+            date: p.injuries[0].date,
+          });
+        }
+      }
+    }
+    injured.sort((a, b) => (a.position === "QB" ? -1 : b.position === "QB" ? 1 : 0));
+    res.json({ injured });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
