@@ -1216,3 +1216,82 @@ app.get("/api/overunder/accuracy", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ==========================================================================
+// ---- NFL — usa la API "oculta" de ESPN (site.api.espn.com) ----
+// No es una API oficial de ESPN (no tiene documentación pública ni
+// garantía de soporte), pero es real, gratuita, sin llave, y confirmada
+// funcionando con datos actuales — usada de forma estable por proyectos
+// de la comunidad desde hace años. A diferencia de MLB Stats API (100%
+// oficial), esto podría cambiar sin aviso — se cachea agresivamente para
+// no depender de ella en cada clic.
+// ==========================================================================
+
+const ESPN_NFL_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard";
+const ESPN_NFL_STANDINGS = "https://site.api.espn.com/apis/v2/sports/football/nfl/standings";
+
+// ---- GET /api/nfl/games ----
+// Calendario real de la semana actual de NFL (o la semana que se pida),
+// con marcador y estado real de cada partido.
+app.get("/api/nfl/games", async (req, res) => {
+  try {
+    const weekParam = req.query.week ? `?week=${req.query.week}` : "";
+    const data = await cachedFetch(
+      `nfl-games-${req.query.week || "current"}`,
+      `${ESPN_NFL_SCOREBOARD}${weekParam}`,
+      15 * 60 * 1000
+    );
+    const games = (data.events || []).map((e) => {
+      const comp = e.competitions[0];
+      const home = comp.competitors.find((c) => c.homeAway === "home");
+      const away = comp.competitors.find((c) => c.homeAway === "away");
+      return {
+        id: e.id,
+        date: comp.date,
+        venue: comp.venue?.fullName || null,
+        homeCode: home.team.abbreviation,
+        homeName: home.team.displayName,
+        homeScore: home.score != null ? parseInt(home.score) : null,
+        awayCode: away.team.abbreviation,
+        awayName: away.team.displayName,
+        awayScore: away.score != null ? parseInt(away.score) : null,
+        status: comp.status.type.description,
+        completed: comp.status.type.completed,
+      };
+    });
+    res.json({ week: data.week?.number ?? null, games });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nfl/standings ----
+// Tabla real de posiciones de NFL — récord, diferencial de puntos, y
+// racha actual de cada equipo, separado por conferencia.
+app.get("/api/nfl/standings", async (req, res) => {
+  try {
+    const data = await cachedFetch("nfl-standings", ESPN_NFL_STANDINGS, 60 * 60 * 1000);
+    const teams = [];
+    for (const conf of data.children || []) {
+      for (const entry of conf.standings?.entries || []) {
+        const statByType = Object.fromEntries((entry.stats || []).map((s) => [s.type, s]));
+        teams.push({
+          code: entry.team.abbreviation,
+          name: entry.team.displayName,
+          wins: statByType.wins?.value ?? 0,
+          losses: statByType.losses?.value ?? 0,
+          ties: statByType.ties?.value ?? 0,
+          winPercent: statByType.winpercent?.value ?? 0,
+          pointsFor: statByType.pointsfor?.value ?? 0,
+          pointsAgainst: statByType.pointsagainst?.value ?? 0,
+          streak: statByType.streak?.displayValue ?? null,
+          conference: conf.abbreviation,
+        });
+      }
+    }
+    teams.sort((a, b) => b.winPercent - a.winPercent);
+    res.json({ teams });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
