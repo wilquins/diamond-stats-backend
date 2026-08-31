@@ -1029,3 +1029,130 @@ app.get("/api/team/:code/rest", async (req, res) => {
   }
 });
 
+// ---- POST /api/overunder/save ----
+// Guarda la predicción real de Over/Under de un partido — evita
+// duplicados igual que /api/predictions/save.
+app.post("/api/overunder/save", async (req, res) => {
+  const { game_date, home_code, away_code, line, over_prob, expected_runs } = req.body || {};
+  if (!game_date || !home_code || !away_code || line == null || over_prob == null || expected_runs == null) {
+    return res.status(400).json({ error: "Faltan datos requeridos" });
+  }
+  try {
+    const checkUrl = `${SUPABASE_URL}/rest/v1/overunder_predictions?game_date=eq.${game_date}&home_code=eq.${home_code}&away_code=eq.${away_code}&select=id`;
+    const existing = await fetch(checkUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    if (Array.isArray(existing) && existing.length > 0) {
+      return res.json({ saved: false, reason: "ya existía una predicción de Over/Under para este partido" });
+    }
+    const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/overunder_predictions`, {
+      method: "POST",
+      headers: { ...supabaseHeaders, Prefer: "return=representation" },
+      body: JSON.stringify([{ game_date, home_code, away_code, line, over_prob, expected_runs }]),
+    });
+    if (!insertRes.ok) throw new Error(`Supabase insert error ${insertRes.status}`);
+    res.json({ saved: true });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- POST /api/overunder/check ----
+// Revisa predicciones de Over/Under de días anteriores sin comparar, y
+// busca el marcador final real para saber si de verdad pasó Over o Under.
+app.post("/api/overunder/check", async (req, res) => {
+  try {
+    const pendingUrl = `${SUPABASE_URL}/rest/v1/overunder_predictions?checked_at=is.null&game_date=lt.${todayET()}&select=*`;
+    const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    let updated = 0;
+
+    for (const pred of pending) {
+      const homeId = TEAM_IDS[pred.home_code];
+      if (!homeId) continue;
+      const data = await cachedFetch(
+        `schedule-day-${homeId}-${pred.game_date}`,
+        `${MLB_API}/schedule?sportId=1&teamId=${homeId}&date=${pred.game_date}`,
+        60 * 60 * 1000
+      );
+      const games = data.dates?.[0]?.games || [];
+      const match = games.find(
+        (g) =>
+          TEAM_ID_TO_CODE[g.teams.away.team.id] === pred.away_code &&
+          g.status?.abstractGameState === "Final" &&
+          g.teams.home.score != null && g.teams.away.score != null
+      );
+      if (!match) continue;
+
+      const totalRuns = match.teams.home.score + match.teams.away.score;
+      const result = totalRuns > pred.line ? "over" : totalRuns < pred.line ? "under" : "push";
+
+      await fetch(`${SUPABASE_URL}/rest/v1/overunder_predictions?id=eq.${pred.id}`, {
+        method: "PATCH",
+        headers: supabaseHeaders,
+        body: JSON.stringify({ actual_total_runs: totalRuns, actual_result: result, checked_at: new Date().toISOString() }),
+      });
+      updated++;
+    }
+    res.json({ checked: pending.length, updated });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/overunder/accuracy ----
+// Precisión real de las predicciones de Over/Under, con calibración por
+// rango de confianza — misma idea que /api/predictions/accuracy.
+app.get("/api/overunder/accuracy", async (req, res) => {
+  try {
+    const since = req.query.since;
+    const sinceFilter = since ? `&game_date=gte.${since}` : "";
+    const url = `${SUPABASE_URL}/rest/v1/overunder_predictions?checked_at=not.is.null${sinceFilter}&select=*&order=game_date.desc`;
+    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.json({ totalChecked: 0, accuracy: null, recent: [], calibration: [] });
+    }
+
+    // Solo cuenta predicciones donde el juego no empujó exacto a la línea
+    // (push) — un push no es ni acierto ni fallo real de dirección.
+    const decisive = rows.filter((r) => r.actual_result !== "push");
+    let correct = 0;
+    for (const r of decisive) {
+      const predictedSide = r.over_prob >= 0.5 ? "over" : "under";
+      if (predictedSide === r.actual_result) correct++;
+    }
+
+    const buckets = [
+      { label: "50-60%", min: 0.5, max: 0.6 },
+      { label: "60-70%", min: 0.6, max: 0.7 },
+      { label: "70-80%", min: 0.7, max: 0.8 },
+      { label: "80%+", min: 0.8, max: 1.01 },
+    ];
+    const calibration = buckets.map(({ label, min, max }) => {
+      const inBucket = decisive.filter((r) => {
+        const sideProb = r.over_prob >= 0.5 ? r.over_prob : 1 - r.over_prob;
+        return sideProb >= min && sideProb < max;
+      });
+      if (inBucket.length === 0) return { label, count: 0, predictedAvg: null, actualRate: null };
+      let sideWon = 0;
+      let probSum = 0;
+      for (const r of inBucket) {
+        const sideProb = r.over_prob >= 0.5 ? r.over_prob : 1 - r.over_prob;
+        const predictedSide = r.over_prob >= 0.5 ? "over" : "under";
+        probSum += sideProb;
+        if (r.actual_result === predictedSide) sideWon++;
+      }
+      return { label, count: inBucket.length, predictedAvg: probSum / inBucket.length, actualRate: sideWon / inBucket.length };
+    });
+
+    res.json({
+      totalChecked: decisive.length,
+      accuracy: decisive.length > 0 ? correct / decisive.length : null,
+      calibration,
+      recent: rows.slice(0, 15).map((r) => ({
+        date: r.game_date, home: r.home_code, away: r.away_code,
+        line: r.line, overProb: r.over_prob, expectedRuns: r.expected_runs,
+        actualTotalRuns: r.actual_total_runs, actualResult: r.actual_result,
+      })),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
