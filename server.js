@@ -368,12 +368,12 @@ app.get("/api/probable-pitchers", async (req, res) => {
       `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher`
     );
     const pitcherInfo = async (p) => {
-      if (!p) return { name: "Por confirmar", hand: null, era: null };
+      if (!p) return { name: "Por confirmar", hand: null, era: null, id: null };
       const [hand, era] = await Promise.all([
         p.pitchHand?.code ? Promise.resolve(p.pitchHand.code) : (p.id ? fetchPitcherHand(p.id) : Promise.resolve(null)),
         p.id ? fetchPitcherEra(p.id) : Promise.resolve(null),
       ]);
-      return { name: p.fullName, hand, era };
+      return { name: p.fullName, hand, era, id: p.id ?? null };
     };
     const rawGames = data.dates?.[0]?.games || [];
     const games = await Promise.all(
@@ -385,8 +385,8 @@ app.get("/api/probable-pitchers", async (req, res) => {
           away: g.teams.away.team.name,
           venue: g.venue?.name,
           time: g.gameDate,
-          homePitcher: home.name, homePitcherHand: home.hand, homePitcherEra: home.era,
-          awayPitcher: away.name, awayPitcherHand: away.hand, awayPitcherEra: away.era,
+          homePitcher: home.name, homePitcherHand: home.hand, homePitcherEra: home.era, homePitcherId: home.id,
+          awayPitcher: away.name, awayPitcherHand: away.hand, awayPitcherEra: away.era, awayPitcherId: away.id,
         };
       })
     );
@@ -411,12 +411,12 @@ app.get("/api/games/today", async (req, res) => {
       `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher`
     );
     const pitcherInfo = async (p) => {
-      if (!p) return { name: "Por confirmar", hand: null, era: null };
+      if (!p) return { name: "Por confirmar", hand: null, era: null, id: null };
       const [hand, era] = await Promise.all([
         p.pitchHand?.code ? Promise.resolve(p.pitchHand.code) : (p.id ? fetchPitcherHand(p.id) : Promise.resolve(null)),
         p.id ? fetchPitcherEra(p.id) : Promise.resolve(null),
       ]);
-      return { name: p.fullName, hand, era };
+      return { name: p.fullName, hand, era, id: p.id ?? null };
     };
     const rawGames = data.dates?.[0]?.games || [];
     const games = await Promise.all(
@@ -1325,6 +1325,65 @@ app.get("/api/nfl/team/:teamId/injuries", async (req, res) => {
     }
     injured.sort((a, b) => (a.position === "QB" ? -1 : b.position === "QB" ? 1 : 0));
     res.json({ injured });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/player/:id/matchup-splits ----
+// Desglose real de hits de un bateador: casa vs ruta (esta temporada),
+// contra el equipo rival de hoy (vsTeam), y contra el pitcher específico
+// de hoy en toda su carrera (vsPlayer) — la MLB Stats API ya provee los
+// tres, vía sitCodes y stats=vsTeam/vsPlayer.
+app.get("/api/player/:id/matchup-splits", async (req, res) => {
+  const { id } = req.params;
+  const { opposingTeamCode, opposingPitcherId } = req.query;
+  const season = new Date().getFullYear();
+
+  // De una lista de juegos, cuenta en cuántos tuvo al menos 1 hit — mismo
+  // formato que "Hit en 15 de los últimos 17 juegos".
+  const countHitGames = (games) => {
+    const withHit = games.filter((g) => (g.stat?.hits ?? 0) > 0).length;
+    return { count: withHit, total: games.length, pct: games.length > 0 ? withHit / games.length : null };
+  };
+
+  try {
+    const logData = await cachedFetch(
+      `gamelog-${id}-${season}`,
+      `${MLB_API}/people/${id}/stats?stats=gameLog&group=hitting&season=${season}`,
+      30 * 60 * 1000
+    );
+    // El gameLog viene en orden cronológico ASCENDENTE (más viejo primero)
+    // — mismo dato ya confirmado real en /api/player/:id/streak. Lo
+    // invertimos para trabajar del más reciente hacia atrás.
+    const allGames = (logData.stats?.[0]?.splits || []).filter((g) => (g.stat?.atBats ?? 0) > 0).reverse();
+
+    const recent = countHitGames(allGames.slice(0, 17));
+
+    let vsTeam = null;
+    if (opposingTeamCode) {
+      const vsTeamGames = allGames.filter((g) => g.opponent?.abbreviation === opposingTeamCode).slice(0, 5);
+      vsTeam = { ...countHitGames(vsTeamGames), teamCode: opposingTeamCode };
+    }
+
+    const homeGames = countHitGames(allGames.filter((g) => g.isHome === true).slice(0, 7));
+    const awayGames = countHitGames(allGames.filter((g) => g.isHome === false).slice(0, 7));
+
+    // vs pitcher específico: en toda su carrera (no solo esta temporada),
+    // porque enfrentar al MISMO pitcher varias veces en un año es raro —
+    // se muestra en hits/turnos totales, como la referencia real.
+    let vsPitcher = null;
+    if (opposingPitcherId) {
+      const vsPitcherData = await cachedFetch(
+        `splits-vspitcher-${id}-${opposingPitcherId}`,
+        `${MLB_API}/people/${id}/stats?stats=vsPlayer&group=hitting&opposingPlayerId=${opposingPitcherId}`,
+        60 * 60 * 1000
+      ).catch(() => null);
+      const stat = vsPitcherData?.stats?.[0]?.splits?.[0]?.stat;
+      if (stat) vsPitcher = { hits: stat.hits ?? 0, atBats: stat.atBats ?? 0 };
+    }
+
+    res.json({ recent, vsTeam, home: homeGames, away: awayGames, vsPitcher });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
