@@ -1340,11 +1340,29 @@ app.get("/api/player/:id/matchup-splits", async (req, res) => {
   const { opposingTeamCode, opposingPitcherId } = req.query;
   const season = new Date().getFullYear();
 
-  // De una lista de juegos, cuenta en cuántos tuvo al menos 1 hit — mismo
-  // formato que "Hit en 15 de los últimos 17 juegos".
-  const countHitGames = (games) => {
-    const withHit = games.filter((g) => (g.stat?.hits ?? 0) > 0).length;
-    return { count: withHit, total: games.length, pct: games.length > 0 ? withHit / games.length : null };
+  // De una lista de juegos, cuenta en cuántos tuvo al menos 1 del tipo
+  // pedido — mismo formato que "Hit en 15 de los últimos 17 juegos".
+  // "field" es una función que recibe el stat del juego y devuelve el
+  // conteo de ese tipo específico (hit o sencillo).
+  const countGames = (games, field) => {
+    const withStat = games.filter((g) => field(g.stat) > 0).length;
+    return { count: withStat, total: games.length, pct: games.length > 0 ? withStat / games.length : null };
+  };
+  const hitsOf = (s) => s?.hits ?? 0;
+  const singlesOf = (s) => (s?.hits ?? 0) - (s?.doubles ?? 0) - (s?.triples ?? 0) - (s?.homeRuns ?? 0);
+
+  const buildBreakdown = (allGames, field, vsPitcherStat) => {
+    const recent = countGames(allGames.slice(0, 17), field);
+    let vsTeam = null;
+    if (opposingTeamCode) {
+      const vsTeamGames = allGames.filter((g) => g.opponent?.abbreviation === opposingTeamCode).slice(0, 5);
+      vsTeam = { ...countGames(vsTeamGames, field), teamCode: opposingTeamCode };
+    }
+    const home = countGames(allGames.filter((g) => g.isHome === true).slice(0, 7), field);
+    const away = countGames(allGames.filter((g) => g.isHome === false).slice(0, 7), field);
+    let vsPitcher = null;
+    if (vsPitcherStat) vsPitcher = { hits: field(vsPitcherStat), atBats: vsPitcherStat.atBats ?? 0 };
+    return { recent, vsTeam, home, away, vsPitcher };
   };
 
   try {
@@ -1358,32 +1376,23 @@ app.get("/api/player/:id/matchup-splits", async (req, res) => {
     // invertimos para trabajar del más reciente hacia atrás.
     const allGames = (logData.stats?.[0]?.splits || []).filter((g) => (g.stat?.atBats ?? 0) > 0).reverse();
 
-    const recent = countHitGames(allGames.slice(0, 17));
-
-    let vsTeam = null;
-    if (opposingTeamCode) {
-      const vsTeamGames = allGames.filter((g) => g.opponent?.abbreviation === opposingTeamCode).slice(0, 5);
-      vsTeam = { ...countHitGames(vsTeamGames), teamCode: opposingTeamCode };
-    }
-
-    const homeGames = countHitGames(allGames.filter((g) => g.isHome === true).slice(0, 7));
-    const awayGames = countHitGames(allGames.filter((g) => g.isHome === false).slice(0, 7));
-
     // vs pitcher específico: en toda su carrera (no solo esta temporada),
-    // porque enfrentar al MISMO pitcher varias veces en un año es raro —
-    // se muestra en hits/turnos totales, como la referencia real.
-    let vsPitcher = null;
+    // porque enfrentar al MISMO pitcher varias veces en un año es raro.
+    // Se trae UNA sola vez y se reutiliza para hit y sencillo.
+    let vsPitcherStat = null;
     if (opposingPitcherId) {
       const vsPitcherData = await cachedFetch(
         `splits-vspitcher-${id}-${opposingPitcherId}`,
         `${MLB_API}/people/${id}/stats?stats=vsPlayer&group=hitting&opposingPlayerId=${opposingPitcherId}`,
         60 * 60 * 1000
       ).catch(() => null);
-      const stat = vsPitcherData?.stats?.[0]?.splits?.[0]?.stat;
-      if (stat) vsPitcher = { hits: stat.hits ?? 0, atBats: stat.atBats ?? 0 };
+      vsPitcherStat = vsPitcherData?.stats?.[0]?.splits?.[0]?.stat || null;
     }
 
-    res.json({ recent, vsTeam, home: homeGames, away: awayGames, vsPitcher });
+    res.json({
+      hit: buildBreakdown(allGames, hitsOf, vsPitcherStat),
+      single: buildBreakdown(allGames, singlesOf, vsPitcherStat),
+    });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
