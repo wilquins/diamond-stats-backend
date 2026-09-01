@@ -1338,6 +1338,7 @@ app.get("/api/nfl/team/:teamId/injuries", async (req, res) => {
 app.get("/api/player/:id/matchup-splits", async (req, res) => {
   const { id } = req.params;
   const { opposingTeamCode, opposingPitcherId } = req.query;
+  const opposingTeamId = TEAM_IDS[opposingTeamCode] || null;
   const season = new Date().getFullYear();
 
   // De una lista de juegos, cuenta en cuántos tuvo al menos 1 del tipo
@@ -1355,13 +1356,21 @@ app.get("/api/player/:id/matchup-splits", async (req, res) => {
     const recent = countGames(allGames.slice(0, 17), field);
     let vsTeam = null;
     if (opposingTeamCode) {
-      const vsTeamGames = allGames.filter((g) => g.opponent?.abbreviation === opposingTeamCode).slice(0, 5);
+      // Robusto ante distintos nombres de campo que la API pueda usar
+      // para identificar al rival de ese juego — probamos ID numérico
+      // (más confiable) y abreviación como respaldo, ambos sobre el
+      // campo "opponent" (nunca "team", que es el equipo del propio
+      // jugador, no el rival).
+      const vsTeamGames = allGames.filter((g) => {
+        const opp = g.opponent;
+        return (opposingTeamId && opp?.id === opposingTeamId) || opp?.abbreviation === opposingTeamCode;
+      }).slice(0, 5);
       vsTeam = { ...countGames(vsTeamGames, field), teamCode: opposingTeamCode };
     }
     const home = countGames(allGames.filter((g) => g.isHome === true).slice(0, 7), field);
     const away = countGames(allGames.filter((g) => g.isHome === false).slice(0, 7), field);
     let vsPitcher = null;
-    if (vsPitcherStat) vsPitcher = { hits: field(vsPitcherStat), atBats: vsPitcherStat.atBats ?? 0 };
+    if (opposingPitcherId) vsPitcher = { hits: field(vsPitcherStat || {}), atBats: vsPitcherStat?.atBats ?? 0 };
     return { recent, vsTeam, home, away, vsPitcher };
   };
 
