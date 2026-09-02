@@ -618,10 +618,12 @@ app.get("/api/team/:code/bullpen", async (req, res) => {
       .map((p) => {
         const s = p.person.stats?.[0]?.splits?.[0]?.stat || {};
         return {
+          id: p.person.id, name: p.person.fullName,
           g: s.gamesPlayed || 0, gs: s.gamesStarted || 0,
           era: s.era != null ? parseFloat(s.era) : null,
           whip: s.whip != null ? parseFloat(s.whip) : null,
           ip: s.inningsPitched != null ? parseFloat(s.inningsPitched) : 0,
+          saves: s.saves || 0,
         };
       })
       // Relevista = casi nunca abre juegos (permite alguna apertura de emergencia)
@@ -631,12 +633,43 @@ app.get("/api/team/:code/bullpen", async (req, res) => {
     const bullpenERA = totalIP > 0 ? relievers.reduce((sum, p) => sum + p.era * p.ip, 0) / totalIP : null;
     const bullpenWHIP = totalIP > 0 ? relievers.reduce((sum, p) => sum + p.whip * p.ip, 0) / totalIP : null;
 
+    // ---- Cerrador real y su fatiga ----
+    // El cerrador se identifica como el relevista con más saves reales
+    // esta temporada (mínimo 1) — sin adivinar, solo evidencia. Se revisa
+    // su gameLog real para ver en cuántos de los últimos 3 días
+    // CALENDARIO lanzó — 2 o más es una señal real de fatiga, aunque su
+    // ERA de temporada sea buena.
+    let closer = null;
+    const closerCandidate = relievers.filter((p) => p.saves > 0).sort((a, b) => b.saves - a.saves)[0];
+    if (closerCandidate) {
+      const season = new Date().getFullYear();
+      const logData = await cachedFetch(
+        `pitcher-gamelog-${closerCandidate.id}-${season}`,
+        `${MLB_API}/people/${closerCandidate.id}/stats?stats=gameLog&group=pitching&season=${season}`,
+        3 * 60 * 60 * 1000
+      ).catch(() => null);
+      const splits = logData?.stats?.[0]?.splits || [];
+      const appearanceDates = new Set(splits.map((s) => s.date));
+      const today = new Date();
+      let daysWorkedLast3 = 0;
+      for (let i = 1; i <= 3; i++) {
+        const d = new Date(today);
+        d.setDate(d.getDate() - i);
+        if (appearanceDates.has(d.toISOString().slice(0, 10))) daysWorkedLast3++;
+      }
+      closer = {
+        name: closerCandidate.name, saves: closerCandidate.saves,
+        daysWorkedLast3, fatigued: daysWorkedLast3 >= 2,
+      };
+    }
+
     res.json({
       updated: new Date().toISOString(),
       relieverCount: relievers.length,
       totalIP: Math.round(totalIP * 10) / 10,
       bullpenERA: bullpenERA != null ? Math.round(bullpenERA * 100) / 100 : null,
       bullpenWHIP: bullpenWHIP != null ? Math.round(bullpenWHIP * 100) / 100 : null,
+      closer,
     });
   } catch (err) {
     res.status(502).json({ error: err.message });
