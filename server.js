@@ -1009,6 +1009,22 @@ app.post("/api/picks/check", async (req, res) => {
           const gameThatDay = splits.find((s) => s.date === pick.pick_date);
           if (gameThatDay) success = (gameThatDay.stat?.hits ?? 0) > 0;
         } catch { /* se revisa en otra ronda */ }
+      } else if (pick.pick_type === "single" && pick.player_id) {
+        try {
+          const season = new Date(pick.pick_date).getFullYear();
+          const data = await cachedFetch(
+            `gamelog-${pick.player_id}-${season}`,
+            `${MLB_API}/people/${pick.player_id}/stats?stats=gameLog&group=hitting&season=${season}`,
+            60 * 60 * 1000
+          );
+          const splits = data.stats?.[0]?.splits || [];
+          const gameThatDay = splits.find((s) => s.date === pick.pick_date);
+          if (gameThatDay) {
+            const s = gameThatDay.stat;
+            const singles = (s?.hits ?? 0) - (s?.doubles ?? 0) - (s?.triples ?? 0) - (s?.homeRuns ?? 0);
+            success = singles > 0;
+          }
+        } catch { /* se revisa en otra ronda */ }
       } else if (pick.pick_type === "team") {
         try {
           const teamId = TEAM_IDS[pick.team_code];
@@ -1060,6 +1076,7 @@ app.get("/api/picks/accuracy", async (req, res) => {
 
     res.json({
       batters: summarize("batter"),
+      singles: summarize("single"),
       teams: summarize("team"),
       recent: rows.slice(0, 20).map((r) => ({
         date: r.pick_date, type: r.pick_type, name: r.player_name, team: r.team_code,
