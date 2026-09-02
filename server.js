@@ -1462,3 +1462,60 @@ app.get("/api/player/:id/matchup-splits", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ---- GET /api/nfl/team/:teamId/stats ----
+// Estadísticas reales de equipo — el dato clave es el diferencial de
+// balón (turnOverDifferential), una de las métricas más predictivas en
+// NFL, a menudo más que el récord solo.
+app.get("/api/nfl/team/:teamId/stats", async (req, res) => {
+  const { teamId } = req.params;
+  const season = new Date().getFullYear();
+  try {
+    const data = await cachedFetch(
+      `nfl-team-stats-${teamId}-${season}`,
+      `https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/seasons/${season}/types/2/teams/${teamId}/statistics`,
+      60 * 60 * 1000
+    );
+    const misc = data.splits?.categories?.find((c) => c.name === "miscellaneous");
+    const findStat = (name) => misc?.stats?.find((s) => s.name === name)?.value ?? null;
+    res.json({
+      turnoverDifferential: findStat("turnOverDifferential"),
+      totalTakeaways: findStat("totalTakeaways"),
+      totalGiveaways: findStat("totalGiveaways"),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nfl/headtohead/:teamId1/:teamId2 ----
+// Historial real cara a cara entre dos equipos ESTA temporada — en NFL
+// casi siempre son 0 o 1 juegos previos (2 solo si son rivales de
+// división), a diferencia de MLB. Se revisa el calendario real de uno
+// de los dos equipos, filtrando los juegos contra el otro.
+app.get("/api/nfl/headtohead/:teamId1/:teamId2", async (req, res) => {
+  const { teamId1, teamId2 } = req.params;
+  const season = new Date().getFullYear();
+  try {
+    const data = await cachedFetch(
+      `nfl-schedule-${teamId1}-${season}`,
+      `https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${teamId1}/schedule?season=${season}`,
+      60 * 60 * 1000
+    );
+    const games = (data.events || []).filter((e) => {
+      const comp = e.competitions?.[0];
+      const opponent = comp?.competitors?.find((c) => c.id !== teamId1);
+      return opponent?.id === teamId2 && comp?.status?.type?.completed;
+    });
+    let team1Wins = 0, team2Wins = 0;
+    for (const g of games) {
+      const comp = g.competitions[0];
+      const team1Comp = comp.competitors.find((c) => c.id === teamId1);
+      if (team1Comp?.winner) team1Wins++;
+      else if (team1Comp?.winner === false) team2Wins++;
+    }
+    res.json({ gamesPlayed: games.length, team1Wins, team2Wins });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
