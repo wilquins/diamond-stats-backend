@@ -1095,6 +1095,7 @@ app.get("/api/team/:code/rest", async (req, res) => {
 app.post("/api/overunder/save", async (req, res) => {
   const { game_date, home_code, away_code, line, over_prob, expected_runs } = req.body || {};
   if (!game_date || !home_code || !away_code || line == null || over_prob == null || expected_runs == null) {
+    console.error("[overunder/save] Faltan datos:", req.body);
     return res.status(400).json({ error: "Faltan datos requeridos" });
   }
   try {
@@ -1108,9 +1109,14 @@ app.post("/api/overunder/save", async (req, res) => {
       headers: { ...supabaseHeaders, Prefer: "return=representation" },
       body: JSON.stringify([{ game_date, home_code, away_code, line, over_prob, expected_runs }]),
     });
-    if (!insertRes.ok) throw new Error(`Supabase insert error ${insertRes.status}`);
+    if (!insertRes.ok) {
+      const bodyText = await insertRes.text().catch(() => "(sin cuerpo)");
+      console.error(`[overunder/save] Supabase insert error ${insertRes.status}:`, bodyText);
+      throw new Error(`Supabase insert error ${insertRes.status}: ${bodyText}`);
+    }
     res.json({ saved: true });
   } catch (err) {
+    console.error("[overunder/save] Error:", err.message);
     res.status(502).json({ error: err.message });
   }
 });
