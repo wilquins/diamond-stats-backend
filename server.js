@@ -1577,3 +1577,110 @@ app.get("/api/nfl/weather/:code", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ---- POST /api/nfl/overunder/save ----
+app.post("/api/nfl/overunder/save", async (req, res) => {
+  const { game_date, week, home_code, away_code, line, over_prob, expected_total } = req.body || {};
+  if (!game_date || !home_code || !away_code || line == null || over_prob == null || expected_total == null) {
+    return res.status(400).json({ error: "Faltan datos requeridos" });
+  }
+  try {
+    const checkUrl = `${SUPABASE_URL}/rest/v1/nfl_overunder_predictions?game_date=eq.${game_date}&home_code=eq.${home_code}&away_code=eq.${away_code}&select=id`;
+    const existing = await fetch(checkUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    if (Array.isArray(existing) && existing.length > 0) {
+      return res.json({ saved: false, reason: "ya existía" });
+    }
+    const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/nfl_overunder_predictions`, {
+      method: "POST",
+      headers: { ...supabaseHeaders, Prefer: "return=representation" },
+      body: JSON.stringify([{ game_date, week: week || null, home_code, away_code, line, over_prob, expected_total }]),
+    });
+    if (!insertRes.ok) {
+      const bodyText = await insertRes.text().catch(() => "(sin cuerpo)");
+      console.error(`[nfl/overunder/save] Supabase insert error ${insertRes.status}:`, bodyText);
+      throw new Error(`Supabase insert error ${insertRes.status}: ${bodyText}`);
+    }
+    res.json({ saved: true });
+  } catch (err) {
+    console.error("[nfl/overunder/save] Error:", err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- POST /api/nfl/overunder/check ----
+// Revisa predicciones pendientes buscando el marcador final real en la
+// semana correspondiente del calendario de ESPN.
+app.post("/api/nfl/overunder/check", async (req, res) => {
+  try {
+    const today = todayET();
+    const pendingUrl = `${SUPABASE_URL}/rest/v1/nfl_overunder_predictions?checked_at=is.null&game_date=lt.${today}&select=*`;
+    const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    let updated = 0;
+
+    // Agrupa por semana para no repetir la misma consulta de calendario.
+    const weekCache = {};
+    for (const pred of pending) {
+      if (pred.week == null) continue;
+      if (!weekCache[pred.week]) {
+        const data = await cachedFetch(
+          `nfl-games-check-${pred.week}`,
+          `https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week=${pred.week}`,
+          15 * 60 * 1000
+        );
+        weekCache[pred.week] = data.events || [];
+      }
+      const events = weekCache[pred.week];
+      const match = events.find((e) => {
+        const comp = e.competitions?.[0];
+        const home = comp?.competitors?.find((c) => c.homeAway === "home");
+        const away = comp?.competitors?.find((c) => c.homeAway === "away");
+        return home?.team?.abbreviation === pred.home_code && away?.team?.abbreviation === pred.away_code && comp?.status?.type?.completed;
+      });
+      if (!match) continue;
+
+      const comp = match.competitions[0];
+      const home = comp.competitors.find((c) => c.homeAway === "home");
+      const away = comp.competitors.find((c) => c.homeAway === "away");
+      const totalPoints = parseInt(home.score) + parseInt(away.score);
+      const result = totalPoints > pred.line ? "over" : totalPoints < pred.line ? "under" : "push";
+
+      await fetch(`${SUPABASE_URL}/rest/v1/nfl_overunder_predictions?id=eq.${pred.id}`, {
+        method: "PATCH",
+        headers: supabaseHeaders,
+        body: JSON.stringify({ actual_total_points: totalPoints, actual_result: result, checked_at: new Date().toISOString() }),
+      });
+      updated++;
+    }
+    res.json({ checked: pending.length, updated });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nfl/overunder/accuracy ----
+app.get("/api/nfl/overunder/accuracy", async (req, res) => {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/nfl_overunder_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
+    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.json({ totalChecked: 0, accuracy: null, recent: [] });
+    }
+    const decisive = rows.filter((r) => r.actual_result !== "push");
+    let correct = 0;
+    for (const r of decisive) {
+      const predictedSide = r.over_prob >= 0.5 ? "over" : "under";
+      if (predictedSide === r.actual_result) correct++;
+    }
+    res.json({
+      totalChecked: decisive.length,
+      accuracy: decisive.length > 0 ? correct / decisive.length : null,
+      recent: rows.slice(0, 15).map((r) => ({
+        date: r.game_date, home: r.home_code, away: r.away_code,
+        line: r.line, overProb: r.over_prob, expectedTotal: r.expected_total,
+        actualTotalPoints: r.actual_total_points, actualResult: r.actual_result,
+      })),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
