@@ -1519,3 +1519,61 @@ app.get("/api/nfl/headtohead/:teamId1/:teamId2", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ---- Coordenadas y techo real de los 32 estadios de NFL ----
+// roofed: true = techo cerrado o fijo (el clima NO afecta el juego).
+// Confirmado con conocimiento general de cada estadio — si alguno
+// cambiara de estadio o de tipo de techo, se corrige aquí.
+const NFL_STADIUM_COORDS = {
+  ARI: { lat: 33.5276, lon: -112.2626, roofed: true },
+  ATL: { lat: 33.7554, lon: -84.4008, roofed: true },
+  BAL: { lat: 39.2780, lon: -76.6227, roofed: false },
+  BUF: { lat: 42.7738, lon: -78.7870, roofed: false },
+  CAR: { lat: 35.2258, lon: -80.8528, roofed: false },
+  CHI: { lat: 41.8623, lon: -87.6167, roofed: false },
+  CIN: { lat: 39.0955, lon: -84.5160, roofed: false },
+  CLE: { lat: 41.5061, lon: -81.6995, roofed: false },
+  DAL: { lat: 32.7473, lon: -97.0945, roofed: true },
+  DEN: { lat: 39.7439, lon: -105.0201, roofed: false },
+  DET: { lat: 42.3400, lon: -83.0456, roofed: true },
+  GB: { lat: 44.5013, lon: -88.0622, roofed: false },
+  HOU: { lat: 29.6847, lon: -95.4107, roofed: true },
+  IND: { lat: 39.7601, lon: -86.1639, roofed: true },
+  JAX: { lat: 30.3239, lon: -81.6373, roofed: false },
+  KC: { lat: 39.0489, lon: -94.4839, roofed: false },
+  LV: { lat: 36.0909, lon: -115.1833, roofed: true },
+  LAC: { lat: 33.9535, lon: -118.3392, roofed: true },
+  LAR: { lat: 33.9535, lon: -118.3392, roofed: true },
+  MIA: { lat: 25.9580, lon: -80.2389, roofed: false },
+  MIN: { lat: 44.9737, lon: -93.2577, roofed: true },
+  NE: { lat: 42.0909, lon: -71.2643, roofed: false },
+  NO: { lat: 29.9511, lon: -90.0812, roofed: true },
+  NYG: { lat: 40.8135, lon: -74.0745, roofed: false },
+  NYJ: { lat: 40.8135, lon: -74.0745, roofed: false },
+  PHI: { lat: 39.9008, lon: -75.1675, roofed: false },
+  PIT: { lat: 40.4468, lon: -80.0158, roofed: false },
+  SEA: { lat: 47.5952, lon: -122.3316, roofed: false },
+  SF: { lat: 37.4032, lon: -121.9698, roofed: false },
+  TB: { lat: 27.9759, lon: -82.5033, roofed: false },
+  TEN: { lat: 36.1665, lon: -86.7713, roofed: false },
+  WSH: { lat: 38.9076, lon: -76.8645, roofed: false },
+};
+
+// ---- GET /api/nfl/weather/:code ----
+// Clima real del estadio, para la hora específica del primer saque —
+// reutiliza la misma función fetchWeatherNWS que ya usa MLB, solo con
+// las coordenadas correctas de cada estadio de NFL.
+app.get("/api/nfl/weather/:code", async (req, res) => {
+  const code = req.params.code.toUpperCase();
+  const coords = NFL_STADIUM_COORDS[code];
+  if (!coords) return res.status(404).json({ error: "Código de equipo no reconocido" });
+  if (coords.roofed) return res.json({ roofed: true });
+  const gameTime = req.query.gameTime || null;
+
+  try {
+    const data = await fetchWeatherNWS(coords.lat, coords.lon, `nfl-weather-${code}`, gameTime);
+    res.json({ roofed: false, updated: new Date().toISOString(), ...data });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
