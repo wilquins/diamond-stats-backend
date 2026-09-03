@@ -1507,6 +1507,11 @@ app.get("/api/nfl/team/:teamId/stats", async (req, res) => {
 app.get("/api/nfl/headtohead/:teamId1/:teamId2", async (req, res) => {
   const { teamId1, teamId2 } = req.params;
   const season = new Date().getFullYear();
+  // Fecha real de inicio de la temporada REGULAR 2026 — hay que
+  // actualizar este valor cada año. Sin este filtro, el calendario de
+  // ESPN también trae juegos de pretemporada (donde juegan suplentes y
+  // nadie compite en serio), que no deben contar como historial real.
+  const REGULAR_SEASON_START = new Date("2026-09-09T00:00:00Z");
   try {
     const data = await cachedFetch(
       `nfl-schedule-${teamId1}-${season}`,
@@ -1516,7 +1521,7 @@ app.get("/api/nfl/headtohead/:teamId1/:teamId2", async (req, res) => {
     const games = (data.events || []).filter((e) => {
       const comp = e.competitions?.[0];
       const opponent = comp?.competitors?.find((c) => c.id !== teamId1);
-      return opponent?.id === teamId2 && comp?.status?.type?.completed;
+      return opponent?.id === teamId2 && comp?.status?.type?.completed && new Date(e.date) >= REGULAR_SEASON_START;
     });
     let team1Wins = 0, team2Wins = 0;
     for (const g of games) {
@@ -1703,6 +1708,10 @@ app.get("/api/nfl/overunder/accuracy", async (req, res) => {
 app.get("/api/nfl/team/:teamId/home-away-record", async (req, res) => {
   const { teamId } = req.params;
   const season = new Date().getFullYear();
+  // Mismo filtro real de temporada regular — sin esto, contaría juegos
+  // de pretemporada (suplentes, sin competir en serio) como si fueran
+  // récord real.
+  const REGULAR_SEASON_START = new Date("2026-09-09T00:00:00Z");
   try {
     const data = await cachedFetch(
       `nfl-schedule-${teamId}-${season}`,
@@ -1713,13 +1722,98 @@ app.get("/api/nfl/team/:teamId/home-away-record", async (req, res) => {
     const awayRecord = { w: 0, l: 0 };
     for (const e of data.events || []) {
       const comp = e.competitions?.[0];
-      if (!comp?.status?.type?.completed) continue;
+      if (!comp?.status?.type?.completed || new Date(e.date) < REGULAR_SEASON_START) continue;
       const self = comp.competitors?.find((c) => c.id === teamId);
       if (!self || self.winner == null) continue;
       const bucket = self.winner ? "w" : "l";
       (self.homeAway === "home" ? homeRecord : awayRecord)[bucket]++;
     }
     res.json({ homeRecord, awayRecord });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nfl/team/:teamId/skill-stats ----
+// Yardas reales por juego (temporada) y probabilidad de touchdown (vía
+// Poisson, mismo principio que usamos para jonrones en MLB) de los
+// jugadores ofensivos reales — QB, RB, WR, TE — de un equipo. Solo
+// incluye jugadores con uso real esta temporada (no ceros).
+app.get("/api/nfl/team/:teamId/skill-stats", async (req, res) => {
+  const { teamId } = req.params;
+  const season = new Date().getFullYear();
+  let loggedSample = false;
+  try {
+    const roster = await cachedFetch(
+      `nfl-roster-${teamId}`,
+      `https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${teamId}/roster`,
+      30 * 60 * 1000
+    );
+    const skillPlayers = [];
+    for (const group of roster.athletes || []) {
+      for (const p of group.items || []) {
+        const pos = p.position?.abbreviation;
+        if (["QB", "RB", "WR", "TE"].includes(pos)) {
+          skillPlayers.push({ id: p.id, name: p.fullName, position: pos });
+        }
+      }
+    }
+
+    const results = await Promise.all(
+      skillPlayers.map(async (p) => {
+        const statsData = await cachedFetch(
+          `nfl-player-stats-${p.id}-${season}`,
+          `https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/seasons/${season}/types/2/athletes/${p.id}/statistics/0`,
+          60 * 60 * 1000
+        ).catch((err) => { console.error(`[nfl/skill-stats] Fetch falló para ${p.name} (${p.id}):`, err.message); return null; });
+        if (!statsData) return null;
+
+        const categories = statsData.splits?.categories || [];
+        if (!loggedSample) {
+          loggedSample = true;
+          console.error(
+            `[nfl/skill-stats] Muestra real para ${p.name} (${p.position}):`,
+            JSON.stringify(categories.map((c) => ({ name: c.name, stats: (c.stats || []).map((s) => s.name) })))
+          );
+        }
+        if (categories.length === 0) {
+          console.error(`[nfl/skill-stats] Sin categorías para ${p.name} (${p.id}). Respuesta cruda:`, JSON.stringify(statsData).slice(0, 500));
+        }
+        const findStat = (catName, statName) => {
+          const cat = categories.find((c) => c.name === catName);
+          return cat?.stats?.find((s) => s.name === statName)?.value ?? null;
+        };
+
+        let statLine = null;
+        if (p.position === "QB") {
+          const passYds = findStat("passing", "passingYards");
+          const passTds = findStat("passing", "passingTouchdowns");
+          const gp = findStat("passing", "gamesPlayed") ?? findStat("passing", "teamGamesPlayed");
+          if (!passYds || !gp) return null;
+          statLine = { type: "passing", ydsPerGame: passYds / gp, tdPerGame: (passTds ?? 0) / gp };
+        } else if (p.position === "RB") {
+          const rushYds = findStat("rushing", "rushingYards");
+          const rushTds = findStat("rushing", "rushingTouchdowns");
+          const gp = findStat("rushing", "gamesPlayed") ?? findStat("rushing", "teamGamesPlayed");
+          if (!rushYds || !gp) return null;
+          statLine = { type: "rushing", ydsPerGame: rushYds / gp, tdPerGame: (rushTds ?? 0) / gp };
+        } else {
+          const recYds = findStat("receiving", "receivingYards");
+          const recTds = findStat("receiving", "receivingTouchdowns");
+          const gp = findStat("receiving", "gamesPlayed") ?? findStat("receiving", "teamGamesPlayed");
+          if (!recYds || !gp) return null;
+          statLine = { type: "receiving", ydsPerGame: recYds / gp, tdPerGame: (recTds ?? 0) / gp };
+        }
+
+        // Probabilidad de al menos 1 TD vía Poisson — mismo principio
+        // real que ya usamos para jonrones en MLB.
+        const tdProbability = 1 - Math.exp(-statLine.tdPerGame);
+
+        return { id: p.id, name: p.name, position: p.position, ydsPerGame: statLine.ydsPerGame, type: statLine.type, tdProbability };
+      })
+    );
+
+    res.json({ players: results.filter(Boolean) });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
