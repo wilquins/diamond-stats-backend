@@ -1695,3 +1695,32 @@ app.get("/api/nfl/overunder/accuracy", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ---- GET /api/nfl/team/:teamId/home-away-record ----
+// Récord real de casa y ruta de un equipo esta temporada — algunos
+// equipos son genuinamente mucho mejores en su propio estadio. Usa el
+// mismo calendario real que ya usamos para cara a cara.
+app.get("/api/nfl/team/:teamId/home-away-record", async (req, res) => {
+  const { teamId } = req.params;
+  const season = new Date().getFullYear();
+  try {
+    const data = await cachedFetch(
+      `nfl-schedule-${teamId}-${season}`,
+      `https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${teamId}/schedule?season=${season}`,
+      60 * 60 * 1000
+    );
+    const homeRecord = { w: 0, l: 0 };
+    const awayRecord = { w: 0, l: 0 };
+    for (const e of data.events || []) {
+      const comp = e.competitions?.[0];
+      if (!comp?.status?.type?.completed) continue;
+      const self = comp.competitors?.find((c) => c.id === teamId);
+      if (!self || self.winner == null) continue;
+      const bucket = self.winner ? "w" : "l";
+      (self.homeAway === "home" ? homeRecord : awayRecord)[bucket]++;
+    }
+    res.json({ homeRecord, awayRecord });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
