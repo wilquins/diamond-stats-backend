@@ -594,7 +594,18 @@ app.get("/api/team/:code/situational", async (req, res) => {
       }
     }
 
-    res.json({ updated: new Date().toISOString(), season, dayRecord, nightRecord, byWeekday, last10Record, currentStreak });
+    // Récord real de casa y ruta esta temporada — algunos equipos son
+    // genuinamente mucho mejores en su propio estadio que fuera de casa.
+    const homeRecord = { w: 0, l: 0 };
+    const awayRecord = { w: 0, l: 0 };
+    for (const g of games) {
+      const isHome = g.teams.home.team.id === teamId;
+      const won = isHome ? g.teams.home.isWinner : g.teams.away.isWinner;
+      if (won == null) continue;
+      (isHome ? homeRecord : awayRecord)[won ? "w" : "l"]++;
+    }
+
+    res.json({ updated: new Date().toISOString(), season, dayRecord, nightRecord, byWeekday, last10Record, currentStreak, homeRecord, awayRecord });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
