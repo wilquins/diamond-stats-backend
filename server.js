@@ -265,6 +265,23 @@ async function fetchPitcherHand(personId) {
 // — la respuesta de la MLB API no trae stats adentro, aunque se lo
 // pidamos (confirmado con un diagnóstico real). Igual que con la mano,
 // la solución real es una llamada separada y dedicada por pitcher.
+// Convierte el formato real de entradas lanzadas de MLB ("123.1" =
+// 123 entradas + 1 out = 123.333, NO 123.1 decimal) a un número decimal
+// correcto.
+function parseInningsPitched(ipStr) {
+  if (ipStr == null) return null;
+  const ip = parseFloat(ipStr);
+  const whole = Math.floor(ip);
+  const outs = Math.round((ip - whole) * 10); // 0, 1, o 2
+  return whole + outs / 3;
+}
+
+// ERA real, mezclado con FIP real (70% FIP + 30% ERA) — evidencia real
+// de múltiples fuentes profesionales confirma que FIP predice mejor el
+// futuro que ERA solo, porque ERA se ve afectado por suerte (BABIP) y
+// la defensa del equipo, mientras FIP solo mide lo que el pitcher
+// controla directamente: ponches, bases por bola, y jonrones.
+// Constante de FIP aproximada (~3.10), estándar en la era moderna.
 async function fetchPitcherEra(personId) {
   try {
     const season = new Date().getFullYear();
@@ -273,7 +290,20 @@ async function fetchPitcherEra(personId) {
       `${MLB_API}/people/${personId}/stats?stats=season&group=pitching&season=${season}`
     );
     const stat = data.stats?.[0]?.splits?.[0]?.stat;
-    return stat?.era != null ? parseFloat(stat.era) : null;
+    if (!stat?.era) return null;
+    const era = parseFloat(stat.era);
+
+    const ip = parseInningsPitched(stat.inningsPitched);
+    if (!ip || ip <= 0) return era; // sin entradas suficientes para calcular FIP real, se usa solo ERA
+
+    const FIP_CONSTANT = 3.10;
+    const hr = stat.homeRuns ?? 0;
+    const bb = stat.baseOnBalls ?? 0;
+    const hbp = stat.hitBatsmen ?? 0;
+    const k = stat.strikeOuts ?? 0;
+    const fip = (13 * hr + 3 * (bb + hbp) - 2 * k) / ip + FIP_CONSTANT;
+
+    return fip * 0.7 + era * 0.3;
   } catch {
     return null;
   }
@@ -628,12 +658,23 @@ app.get("/api/team/:code/bullpen", async (req, res) => {
       .filter((p) => p.position.abbreviation === "P")
       .map((p) => {
         const s = p.person.stats?.[0]?.splits?.[0]?.stat || {};
+        const ip = parseInningsPitched(s.inningsPitched);
+        const era = s.era != null ? parseFloat(s.era) : null;
+        // Mismo principio real de FIP + ERA (70/30) que ya usamos para
+        // abridores — un relevista con suerte/mala defensa detrás no
+        // debería verse mejor o peor de lo que realmente es.
+        let blendedEra = era;
+        if (era != null && ip && ip > 0) {
+          const FIP_CONSTANT = 3.10;
+          const fip = (13 * (s.homeRuns ?? 0) + 3 * ((s.baseOnBalls ?? 0) + (s.hitBatsmen ?? 0)) - 2 * (s.strikeOuts ?? 0)) / ip + FIP_CONSTANT;
+          blendedEra = fip * 0.7 + era * 0.3;
+        }
         return {
           id: p.person.id, name: p.person.fullName,
           g: s.gamesPlayed || 0, gs: s.gamesStarted || 0,
-          era: s.era != null ? parseFloat(s.era) : null,
+          era: blendedEra,
           whip: s.whip != null ? parseFloat(s.whip) : null,
-          ip: s.inningsPitched != null ? parseFloat(s.inningsPitched) : 0,
+          ip: ip || 0,
           saves: s.saves || 0,
         };
       })
