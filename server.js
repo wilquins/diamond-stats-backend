@@ -249,6 +249,50 @@ async function fetchPlayerSplits(personId) {
   return { vsL, vsR, vsDay: day, vsNight: night };
 }
 
+// ---- Ajuste real de BABIP: temporada vs. carrera ----
+// El promedio de bateo se ve afectado por suerte real (BABIP), pero a
+// diferencia de los pitchers, los bateadores SÍ tienen control real
+// sobre su BABIP (uno rápido de contacto sostiene BABIP alto de verdad,
+// uno lento de poder lo tiene bajo de verdad) — por eso NO se corrige
+// hacia el promedio de LIGA, sino hacia el promedio de CARRERA de ESE
+// bateador específico. Solo se ajusta la parte de jonrones para afuera
+// (que no depende de BABIP), dejando ponches y jonrones como valores
+// reales observados esta temporada (esos sí son habilidad estable).
+async function fetchBabipAdjustedAvg(personId, seasonStats) {
+  try {
+    const data = await cachedFetch(
+      `career-hitting-${personId}`,
+      `${MLB_API}/people/${personId}/stats?stats=career&group=hitting`,
+      24 * 60 * 60 * 1000 // 24h — las estadísticas de carrera casi no cambian de un día a otro
+    );
+    const career = data.stats?.[0]?.splits?.[0]?.stat;
+    // Se requiere muestra de carrera real y suficiente (200+ turnos) —
+    // sin eso, no hay un "nivel personal" confiable con qué comparar.
+    if (!career?.atBats || career.atBats < 200) return null;
+
+    const seasonBIP = seasonStats.atBats - (seasonStats.strikeOuts ?? 0) - (seasonStats.homeRuns ?? 0);
+    const careerBIP = career.atBats - (career.strikeOuts ?? 0) - (career.homeRuns ?? 0);
+    if (seasonBIP <= 0 || careerBIP <= 0) return null;
+
+    const seasonBabip = (seasonStats.hits - (seasonStats.homeRuns ?? 0)) / seasonBIP;
+    const careerBabip = (career.hits - (career.homeRuns ?? 0)) / careerBIP;
+
+    // Punto de estabilización real (~400 bolas en juego), basado en
+    // investigación sabermétrica sobre cuándo el BABIP de un bateador
+    // se vuelve confiable — con poca muestra esta temporada, pesa más
+    // su nivel real de carrera; con mucha, pesa más lo de este año.
+    const STABILIZATION_POINT = 400;
+    const seasonWeight = seasonBIP / (seasonBIP + STABILIZATION_POINT);
+    const blendedBabip = seasonBabip * seasonWeight + careerBabip * (1 - seasonWeight);
+
+    const blendedNonHrHits = blendedBabip * seasonBIP;
+    const blendedTotalHits = blendedNonHrHits + (seasonStats.homeRuns ?? 0);
+    return blendedTotalHits / seasonStats.atBats;
+  } catch {
+    return null;
+  }
+}
+
 // El objeto "probablePitcher" que devuelve el calendario NO incluye su
 // mano de lanzar por defecto — hay que pedirla aparte, igual que hicimos
 // con los splits de los bateadores.
@@ -330,7 +374,7 @@ app.get("/api/team/:code/hitters", async (req, res) => {
           bats: p.person.batSide?.code || null, // "L" | "R" | "S" (switch) | null si no viene
           g: s.gamesPlayed, ab: s.atBats, h: s.hits,
           doubles: s.doubles, triples: s.triples, hr: s.homeRuns,
-          rbi: s.rbi,
+          rbi: s.rbi, strikeOuts: s.strikeOuts,
           avg: s.avg != null ? parseFloat(s.avg) : null,
           obp: s.obp != null ? parseFloat(s.obp) : null,
           slg: s.slg != null ? parseFloat(s.slg) : null,
@@ -339,12 +383,18 @@ app.get("/api/team/:code/hitters", async (req, res) => {
       })
       .filter((p) => p.ab > 0 && p.avg != null && !Number.isNaN(p.avg));
 
-    // Trae el split real de cada bateador en paralelo (uno por jugador).
-    const splitsResults = await Promise.all(rawHitters.map((p) => fetchPlayerSplits(p.id)));
+    // Trae el split real de cada bateador en paralelo (uno por jugador),
+    // y también su ajuste real de BABIP contra su propio historial de
+    // carrera — cuando hay suficiente carrera real para comparar.
+    const [splitsResults, babipResults] = await Promise.all([
+      Promise.all(rawHitters.map((p) => fetchPlayerSplits(p.id))),
+      Promise.all(rawHitters.map((p) => fetchBabipAdjustedAvg(p.id, { atBats: p.ab, hits: p.h, homeRuns: p.hr, strikeOuts: p.strikeOuts }))),
+    ]);
     const hitters = rawHitters.map((p, i) => ({
       ...p,
       vsL: splitsResults[i].vsL, vsR: splitsResults[i].vsR,
       vsDay: splitsResults[i].vsDay, vsNight: splitsResults[i].vsNight,
+      babipAdjustedAvg: babipResults[i], // null si no hay carrera suficiente para comparar
     }));
 
     res.json({ updated: new Date().toISOString(), hitters });
