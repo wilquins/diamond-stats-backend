@@ -722,31 +722,33 @@ app.post("/api/predictions/check", async (req, res) => {
   try {
     const pendingUrl = `${SUPABASE_URL}/rest/v1/predictions?checked_at=is.null&game_date=lt.${todayET()}&select=*`;
     const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
-    let updated = 0;
 
-    for (const pred of pending) {
-      const data = await cachedFetch(
-        `results-${pred.game_date}`,
-        `${MLB_API}/schedule?sportId=1&date=${pred.game_date}`,
-        60 * 60 * 1000
-      );
-      const games = data.dates?.[0]?.games || [];
-      const match = games.find(
-        (g) =>
-          TEAM_ID_TO_CODE[g.teams.home.team.id] === pred.home_code &&
-          TEAM_ID_TO_CODE[g.teams.away.team.id] === pred.away_code &&
-          g.status?.abstractGameState === "Final"
-      );
-      if (!match) continue; // el juego todavía no terminó, o no se encontró — se revisa después
+    const results = await Promise.all(
+      pending.map(async (pred) => {
+        const data = await cachedFetch(
+          `results-${pred.game_date}`,
+          `${MLB_API}/schedule?sportId=1&date=${pred.game_date}`,
+          60 * 60 * 1000
+        );
+        const games = data.dates?.[0]?.games || [];
+        const match = games.find(
+          (g) =>
+            TEAM_ID_TO_CODE[g.teams.home.team.id] === pred.home_code &&
+            TEAM_ID_TO_CODE[g.teams.away.team.id] === pred.away_code &&
+            g.status?.abstractGameState === "Final"
+        );
+        if (!match) return false; // el juego todavía no terminó, o no se encontró — se revisa después
 
-      const winner = match.teams.home.isWinner ? pred.home_code : pred.away_code;
-      await fetch(`${SUPABASE_URL}/rest/v1/predictions?id=eq.${pred.id}`, {
-        method: "PATCH",
-        headers: supabaseHeaders,
-        body: JSON.stringify({ actual_winner: winner, checked_at: new Date().toISOString() }),
-      });
-      updated++;
-    }
+        const winner = match.teams.home.isWinner ? pred.home_code : pred.away_code;
+        await fetch(`${SUPABASE_URL}/rest/v1/predictions?id=eq.${pred.id}`, {
+          method: "PATCH",
+          headers: supabaseHeaders,
+          body: JSON.stringify({ actual_winner: winner, checked_at: new Date().toISOString() }),
+        });
+        return true;
+      })
+    );
+    const updated = results.filter(Boolean).length;
     res.json({ checked: pending.length, updated });
   } catch (err) {
     res.status(502).json({ error: err.message });
@@ -1003,65 +1005,69 @@ app.post("/api/picks/check", async (req, res) => {
     const today = todayET();
     const pendingUrl = `${SUPABASE_URL}/rest/v1/daily_picks?checked_at=is.null&pick_date=lt.${today}&select=*`;
     const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
-    let updated = 0;
 
-    for (const pick of pending) {
-      let success = null;
+    // Se revisan TODOS en paralelo, no uno por uno en serie — con
+    // cientos de picks acumulados, en serie tardaba muchísimo más.
+    const results = await Promise.all(
+      pending.map(async (pick) => {
+        let success = null;
 
-      if (pick.pick_type === "batter" && pick.player_id) {
-        try {
-          const season = new Date(pick.pick_date).getFullYear();
-          const data = await cachedFetch(
-            `gamelog-${pick.player_id}-${season}`,
-            `${MLB_API}/people/${pick.player_id}/stats?stats=gameLog&group=hitting&season=${season}`,
-            60 * 60 * 1000
-          );
-          const splits = data.stats?.[0]?.splits || [];
-          const gameThatDay = splits.find((s) => s.date === pick.pick_date);
-          if (gameThatDay) success = (gameThatDay.stat?.hits ?? 0) > 0;
-        } catch { /* se revisa en otra ronda */ }
-      } else if (pick.pick_type === "single" && pick.player_id) {
-        try {
-          const season = new Date(pick.pick_date).getFullYear();
-          const data = await cachedFetch(
-            `gamelog-${pick.player_id}-${season}`,
-            `${MLB_API}/people/${pick.player_id}/stats?stats=gameLog&group=hitting&season=${season}`,
-            60 * 60 * 1000
-          );
-          const splits = data.stats?.[0]?.splits || [];
-          const gameThatDay = splits.find((s) => s.date === pick.pick_date);
-          if (gameThatDay) {
-            const s = gameThatDay.stat;
-            const singles = (s?.hits ?? 0) - (s?.doubles ?? 0) - (s?.triples ?? 0) - (s?.homeRuns ?? 0);
-            success = singles > 0;
-          }
-        } catch { /* se revisa en otra ronda */ }
-      } else if (pick.pick_type === "team") {
-        try {
-          const teamId = TEAM_IDS[pick.team_code];
-          if (teamId) {
+        if (pick.pick_type === "batter" && pick.player_id) {
+          try {
+            const season = new Date(pick.pick_date).getFullYear();
             const data = await cachedFetch(
-              `schedule-day-${teamId}-${pick.pick_date}`,
-              `${MLB_API}/schedule?sportId=1&teamId=${teamId}&date=${pick.pick_date}`,
+              `gamelog-${pick.player_id}-${season}`,
+              `${MLB_API}/people/${pick.player_id}/stats?stats=gameLog&group=hitting&season=${season}`,
               60 * 60 * 1000
             );
-            const game = (data.dates?.[0]?.games || []).find((g) => g.status?.abstractGameState === "Final");
-            if (game) {
-              const isHome = game.teams.home.team.id === teamId;
-              success = isHome ? game.teams.home.isWinner : game.teams.away.isWinner;
+            const splits = data.stats?.[0]?.splits || [];
+            const gameThatDay = splits.find((s) => s.date === pick.pick_date);
+            if (gameThatDay) success = (gameThatDay.stat?.hits ?? 0) > 0;
+          } catch { /* se revisa en otra ronda */ }
+        } else if (pick.pick_type === "single" && pick.player_id) {
+          try {
+            const season = new Date(pick.pick_date).getFullYear();
+            const data = await cachedFetch(
+              `gamelog-${pick.player_id}-${season}`,
+              `${MLB_API}/people/${pick.player_id}/stats?stats=gameLog&group=hitting&season=${season}`,
+              60 * 60 * 1000
+            );
+            const splits = data.stats?.[0]?.splits || [];
+            const gameThatDay = splits.find((s) => s.date === pick.pick_date);
+            if (gameThatDay) {
+              const s = gameThatDay.stat;
+              const singles = (s?.hits ?? 0) - (s?.doubles ?? 0) - (s?.triples ?? 0) - (s?.homeRuns ?? 0);
+              success = singles > 0;
             }
-          }
-        } catch { /* se revisa en otra ronda */ }
-      }
+          } catch { /* se revisa en otra ronda */ }
+        } else if (pick.pick_type === "team") {
+          try {
+            const teamId = TEAM_IDS[pick.team_code];
+            if (teamId) {
+              const data = await cachedFetch(
+                `schedule-day-${teamId}-${pick.pick_date}`,
+                `${MLB_API}/schedule?sportId=1&teamId=${teamId}&date=${pick.pick_date}`,
+                60 * 60 * 1000
+              );
+              const game = (data.dates?.[0]?.games || []).find((g) => g.status?.abstractGameState === "Final");
+              if (game) {
+                const isHome = game.teams.home.team.id === teamId;
+                success = isHome ? game.teams.home.isWinner : game.teams.away.isWinner;
+              }
+            }
+          } catch { /* se revisa en otra ronda */ }
+        }
 
-      if (success == null) continue; // aún no hay resultado real, se deja pendiente
-      await fetch(`${SUPABASE_URL}/rest/v1/daily_picks?id=eq.${pick.id}`, {
-        method: "PATCH",
-        headers: supabaseHeaders,
-        body: JSON.stringify({ actual_success: success, checked_at: new Date().toISOString() }),
-      });
-      updated++;
-    }
+        if (success == null) return false; // aún no hay resultado real, se deja pendiente
+        await fetch(`${SUPABASE_URL}/rest/v1/daily_picks?id=eq.${pick.id}`, {
+          method: "PATCH",
+          headers: supabaseHeaders,
+          body: JSON.stringify({ actual_success: success, checked_at: new Date().toISOString() }),
+        });
+        return true;
+      })
+    );
+    const updated = results.filter(Boolean).length;
     res.json({ checked: pending.length, updated });
   } catch (err) {
     res.status(502).json({ error: err.message });
@@ -1189,35 +1195,37 @@ app.post("/api/overunder/check", async (req, res) => {
   try {
     const pendingUrl = `${SUPABASE_URL}/rest/v1/overunder_predictions?checked_at=is.null&game_date=lt.${todayET()}&select=*`;
     const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
-    let updated = 0;
 
-    for (const pred of pending) {
-      const homeId = TEAM_IDS[pred.home_code];
-      if (!homeId) continue;
-      const data = await cachedFetch(
-        `schedule-day-${homeId}-${pred.game_date}`,
-        `${MLB_API}/schedule?sportId=1&teamId=${homeId}&date=${pred.game_date}`,
-        60 * 60 * 1000
-      );
-      const games = data.dates?.[0]?.games || [];
-      const match = games.find(
-        (g) =>
-          TEAM_ID_TO_CODE[g.teams.away.team.id] === pred.away_code &&
-          g.status?.abstractGameState === "Final" &&
-          g.teams.home.score != null && g.teams.away.score != null
-      );
-      if (!match) continue;
+    const results = await Promise.all(
+      pending.map(async (pred) => {
+        const homeId = TEAM_IDS[pred.home_code];
+        if (!homeId) return false;
+        const data = await cachedFetch(
+          `schedule-day-${homeId}-${pred.game_date}`,
+          `${MLB_API}/schedule?sportId=1&teamId=${homeId}&date=${pred.game_date}`,
+          60 * 60 * 1000
+        );
+        const games = data.dates?.[0]?.games || [];
+        const match = games.find(
+          (g) =>
+            TEAM_ID_TO_CODE[g.teams.away.team.id] === pred.away_code &&
+            g.status?.abstractGameState === "Final" &&
+            g.teams.home.score != null && g.teams.away.score != null
+        );
+        if (!match) return false;
 
-      const totalRuns = match.teams.home.score + match.teams.away.score;
-      const result = totalRuns > pred.line ? "over" : totalRuns < pred.line ? "under" : "push";
+        const totalRuns = match.teams.home.score + match.teams.away.score;
+        const result = totalRuns > pred.line ? "over" : totalRuns < pred.line ? "under" : "push";
 
-      await fetch(`${SUPABASE_URL}/rest/v1/overunder_predictions?id=eq.${pred.id}`, {
-        method: "PATCH",
-        headers: supabaseHeaders,
-        body: JSON.stringify({ actual_total_runs: totalRuns, actual_result: result, checked_at: new Date().toISOString() }),
-      });
-      updated++;
-    }
+        await fetch(`${SUPABASE_URL}/rest/v1/overunder_predictions?id=eq.${pred.id}`, {
+          method: "PATCH",
+          headers: supabaseHeaders,
+          body: JSON.stringify({ actual_total_runs: totalRuns, actual_result: result, checked_at: new Date().toISOString() }),
+        });
+        return true;
+      })
+    );
+    const updated = results.filter(Boolean).length;
     res.json({ checked: pending.length, updated });
   } catch (err) {
     res.status(502).json({ error: err.message });
@@ -1631,42 +1639,38 @@ app.post("/api/nfl/overunder/check", async (req, res) => {
     const today = todayET();
     const pendingUrl = `${SUPABASE_URL}/rest/v1/nfl_overunder_predictions?checked_at=is.null&game_date=lt.${today}&select=*`;
     const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
-    let updated = 0;
 
-    // Agrupa por semana para no repetir la misma consulta de calendario.
-    const weekCache = {};
-    for (const pred of pending) {
-      if (pred.week == null) continue;
-      if (!weekCache[pred.week]) {
-        const data = await cachedFetch(
+    const results = await Promise.all(
+      pending.map(async (pred) => {
+        if (pred.week == null) return false;
+        const events = await cachedFetch(
           `nfl-games-check-${pred.week}`,
           `https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week=${pred.week}`,
           15 * 60 * 1000
-        );
-        weekCache[pred.week] = data.events || [];
-      }
-      const events = weekCache[pred.week];
-      const match = events.find((e) => {
-        const comp = e.competitions?.[0];
-        const home = comp?.competitors?.find((c) => c.homeAway === "home");
-        const away = comp?.competitors?.find((c) => c.homeAway === "away");
-        return home?.team?.abbreviation === pred.home_code && away?.team?.abbreviation === pred.away_code && comp?.status?.type?.completed;
-      });
-      if (!match) continue;
+        ).then((d) => d.events || []);
+        const match = events.find((e) => {
+          const comp = e.competitions?.[0];
+          const home = comp?.competitors?.find((c) => c.homeAway === "home");
+          const away = comp?.competitors?.find((c) => c.homeAway === "away");
+          return home?.team?.abbreviation === pred.home_code && away?.team?.abbreviation === pred.away_code && comp?.status?.type?.completed;
+        });
+        if (!match) return false;
 
-      const comp = match.competitions[0];
-      const home = comp.competitors.find((c) => c.homeAway === "home");
-      const away = comp.competitors.find((c) => c.homeAway === "away");
-      const totalPoints = parseInt(home.score) + parseInt(away.score);
-      const result = totalPoints > pred.line ? "over" : totalPoints < pred.line ? "under" : "push";
+        const comp = match.competitions[0];
+        const home = comp.competitors.find((c) => c.homeAway === "home");
+        const away = comp.competitors.find((c) => c.homeAway === "away");
+        const totalPoints = parseInt(home.score) + parseInt(away.score);
+        const result = totalPoints > pred.line ? "over" : totalPoints < pred.line ? "under" : "push";
 
-      await fetch(`${SUPABASE_URL}/rest/v1/nfl_overunder_predictions?id=eq.${pred.id}`, {
-        method: "PATCH",
-        headers: supabaseHeaders,
-        body: JSON.stringify({ actual_total_points: totalPoints, actual_result: result, checked_at: new Date().toISOString() }),
-      });
-      updated++;
-    }
+        await fetch(`${SUPABASE_URL}/rest/v1/nfl_overunder_predictions?id=eq.${pred.id}`, {
+          method: "PATCH",
+          headers: supabaseHeaders,
+          body: JSON.stringify({ actual_total_points: totalPoints, actual_result: result, checked_at: new Date().toISOString() }),
+        });
+        return true;
+      })
+    );
+    const updated = results.filter(Boolean).length;
     res.json({ checked: pending.length, updated });
   } catch (err) {
     res.status(502).json({ error: err.message });
