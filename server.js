@@ -385,18 +385,16 @@ app.get("/api/team/:code/hitters", async (req, res) => {
       })
       .filter((p) => p.ab > 0 && p.avg != null && !Number.isNaN(p.avg));
 
-    // Trae el split real de cada bateador en paralelo (uno por jugador),
-    // y también su ajuste real de BABIP contra su propio historial de
-    // carrera — cuando hay suficiente carrera real para comparar.
-    const [splitsResults, babipResults] = await Promise.all([
-      Promise.all(rawHitters.map((p) => fetchPlayerSplits(p.id))),
-      Promise.all(rawHitters.map((p) => fetchBabipAdjustedAvg(p.id, { atBats: p.ab, hits: p.h, homeRuns: p.hr, strikeOuts: p.strikeOuts }))),
-    ]);
+    // Trae el split real de cada bateador en paralelo (uno por jugador).
+    // El ajuste de BABIP se movió a un endpoint aparte, bajo demanda
+    // (/api/player/:id/babip-adjusted) — consultarlo para el roster
+    // COMPLETO de todos los equipos jugando hoy era muy pesado para
+    // Picks del día, que necesita a todos, no solo a los 2 de un juego.
+    const splitsResults = await Promise.all(rawHitters.map((p) => fetchPlayerSplits(p.id)));
     const hitters = rawHitters.map((p, i) => ({
       ...p,
       vsL: splitsResults[i].vsL, vsR: splitsResults[i].vsR,
       vsDay: splitsResults[i].vsDay, vsNight: splitsResults[i].vsNight,
-      babipAdjustedAvg: babipResults[i], // null si no hay carrera suficiente para comparar
     }));
 
     res.json({ updated: new Date().toISOString(), hitters });
@@ -1914,4 +1912,20 @@ app.get("/api/nfl/team/:teamId/skill-stats", async (req, res) => {
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
+});
+
+// ---- GET /api/player/:id/babip-adjusted ----
+// Ajuste real de BABIP bajo demanda — se llama solo para los
+// candidatos finales ya filtrados (no para el roster completo), para
+// no hacer lento a Picks del día, que necesita a todos los equipos
+// jugando hoy, no solo a 2.
+app.get("/api/player/:id/babip-adjusted", async (req, res) => {
+  const { atBats, hits, homeRuns, strikeOuts } = req.query;
+  const seasonStats = {
+    atBats: parseFloat(atBats), hits: parseFloat(hits),
+    homeRuns: parseFloat(homeRuns), strikeOuts: parseFloat(strikeOuts),
+  };
+  if (!seasonStats.atBats) return res.status(400).json({ error: "Faltan datos de temporada" });
+  const babipAdjustedAvg = await fetchBabipAdjustedAvg(req.params.id, seasonStats);
+  res.json({ babipAdjustedAvg });
 });
