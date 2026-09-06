@@ -207,6 +207,8 @@ app.get("/api/standings", async (req, res) => {
           w: t.wins,
           l: t.losses,
           wpct: parseFloat(t.winningPercentage),
+          runsScored: t.runsScored ?? null,
+          runsAllowed: t.runsAllowed ?? null,
         });
       }
     }
