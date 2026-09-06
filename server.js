@@ -1394,7 +1394,7 @@ app.get("/api/overunder/accuracy", async (req, res) => {
 // ==========================================================================
 
 const ESPN_NFL_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard";
-const ESPN_NFL_STANDINGS = "https://site.api.espn.com/apis/v2/sports/football/nfl/standings";
+const ESPN_NFL_STANDINGS = "https://site.api.espn.com/apis/v2/sports/football/nfl/standings?seasontype=2";
 
 // ---- GET /api/nfl/games ----
 // Calendario real de la semana actual de NFL (o la semana que se pida),
