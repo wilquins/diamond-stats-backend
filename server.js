@@ -1929,3 +1929,31 @@ app.get("/api/player/:id/babip-adjusted", async (req, res) => {
   const babipAdjustedAvg = await fetchBabipAdjustedAvg(req.params.id, seasonStats);
   res.json({ babipAdjustedAvg });
 });
+
+// ---- GET /api/team/:code/platoon-split ----
+// Desempeño REAL del equipo (no una suposición genérica) contra zurdos
+// o derechos esta temporada — compara su OPS real contra esa mano
+// específica frente a su OPS real de toda la temporada, para saber si
+// este equipo en particular es genuinamente mejor o peor contra esa
+// mano, más allá de cuántos bateadores zurdos/derechos tenga en el
+// roster.
+app.get("/api/team/:code/platoon-split", async (req, res) => {
+  const teamId = TEAM_IDS[req.params.code.toUpperCase()];
+  const hand = req.query.hand === "L" ? "vl" : req.query.hand === "R" ? "vr" : null;
+  if (!teamId || !hand) return res.status(400).json({ error: "Faltan datos requeridos" });
+
+  try {
+    const season = new Date().getFullYear();
+    const [seasonData, splitData] = await Promise.all([
+      cachedFetch(`team-season-hitting-${teamId}-${season}`, `${MLB_API}/teams/${teamId}/stats?stats=season&group=hitting&season=${season}`, 60 * 60 * 1000),
+      cachedFetch(`team-platoon-${teamId}-${hand}-${season}`, `${MLB_API}/teams/${teamId}/stats?stats=statSplits&group=hitting&sitCodes=${hand}&season=${season}`, 60 * 60 * 1000),
+    ]);
+    const seasonOps = seasonData.stats?.[0]?.splits?.[0]?.stat?.ops != null ? parseFloat(seasonData.stats[0].splits[0].stat.ops) : null;
+    const splitOps = splitData.stats?.[0]?.splits?.[0]?.stat?.ops != null ? parseFloat(splitData.stats[0].splits[0].stat.ops) : null;
+    if (seasonOps == null || splitOps == null) return res.json({ opsDelta: null });
+
+    res.json({ seasonOps, splitOps, opsDelta: splitOps - seasonOps });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
