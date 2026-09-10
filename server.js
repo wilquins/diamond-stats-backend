@@ -1065,14 +1065,26 @@ app.post("/api/picks/save", async (req, res) => {
     return res.status(400).json({ error: "Se esperaba un arreglo 'picks'" });
   }
   try {
+    // Por cada combinación real de fecha+tipo en este guardado, primero
+    // se borran los picks de HOY que aún NO se han revisado (checked_at
+    // nulo) — así, si más tarde sale la alineación real y cambia quién
+    // es el mejor candidato, el guardado se actualiza de verdad en vez
+    // de dejar el pick viejo (posiblemente de alguien que ni jugó) y
+    // agregar el nuevo aparte. Los picks YA revisados nunca se tocan —
+    // alterar un resultado histórico ya calificado sería deshonesto.
+    const dateTypeKeys = new Set(picks.map((p) => `${p.pick_date}|${p.pick_type}`));
+    for (const key of dateTypeKeys) {
+      const [pick_date, pick_type] = key.split("|");
+      await fetch(
+        `${SUPABASE_URL}/rest/v1/daily_picks?pick_date=eq.${pick_date}&pick_type=eq.${pick_type}&checked_at=is.null`,
+        { method: "DELETE", headers: supabaseHeaders }
+      ).catch(() => {});
+    }
+
     let saved = 0;
     for (const p of picks) {
       const { pick_date, pick_type, player_id, player_name, team_code, predicted_prob } = p;
       if (!pick_date || !pick_type || !player_name || !team_code || predicted_prob == null) continue;
-
-      const checkUrl = `${SUPABASE_URL}/rest/v1/daily_picks?pick_date=eq.${pick_date}&pick_type=eq.${pick_type}&player_name=eq.${encodeURIComponent(player_name)}&select=id`;
-      const existing = await fetch(checkUrl, { headers: supabaseHeaders }).then((r) => r.json());
-      if (Array.isArray(existing) && existing.length > 0) continue;
 
       const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/daily_picks`, {
         method: "POST",
