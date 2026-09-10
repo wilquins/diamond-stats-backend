@@ -1969,3 +1969,50 @@ app.get("/api/team/:code/platoon-split", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ---- GET /api/team/:code/lineup-strength ----
+// Fuerza REAL de la alineación confirmada de hoy, comparada contra el
+// promedio del roster completo — si un equipo tiene descansando a sus
+// mejores bateadores hoy, es genuinamente más débil ese día específico,
+// aunque su récord de temporada sea bueno. Reutiliza el mismo caché que
+// /api/team/:code/hitters y /api/game/:gamePk/lineup, sin duplicar
+// consultas nuevas a la MLB API.
+app.get("/api/team/:code/lineup-strength", async (req, res) => {
+  const teamId = TEAM_IDS[req.params.code.toUpperCase()];
+  const { gamePk } = req.query;
+  if (!teamId || !gamePk) return res.status(400).json({ error: "Faltan datos requeridos" });
+
+  try {
+    const rosterData = await cachedFetch(
+      `hitters-${teamId}`,
+      `${MLB_API}/teams/${teamId}/roster?rosterType=active&hydrate=person(stats(type=season,group=hitting))`
+    );
+    const rosterHitters = rosterData.roster
+      .filter((p) => p.position.abbreviation !== "P")
+      .map((p) => {
+        const s = p.person.stats?.[0]?.splits?.[0]?.stat || {};
+        return { name: p.person.fullName, ab: s.atBats ?? 0, ops: s.ops != null ? parseFloat(s.ops) : null };
+      })
+      .filter((p) => p.ab >= 20 && p.ops != null);
+
+    if (rosterHitters.length === 0) return res.json({ opsDelta: null });
+    const rosterAvgOps = rosterHitters.reduce((sum, p) => sum + p.ops, 0) / rosterHitters.length;
+
+    const boxscore = await cachedFetch(`lineup-${gamePk}`, `${MLB_API}/game/${gamePk}/boxscore`);
+    const isHome = teamId === boxscore.teams?.home?.team?.id;
+    const teamSide = isHome ? boxscore.teams?.home : boxscore.teams?.away;
+    const battingOrder = teamSide?.battingOrder || [];
+    if (battingOrder.length === 0) return res.json({ opsDelta: null }); // alineación aún no publicada
+
+    const confirmedNames = new Set(
+      battingOrder.map((id) => teamSide.players?.[`ID${id}`]?.person?.fullName).filter(Boolean)
+    );
+    const confirmedHitters = rosterHitters.filter((p) => confirmedNames.has(p.name));
+    if (confirmedHitters.length === 0) return res.json({ opsDelta: null });
+    const confirmedAvgOps = confirmedHitters.reduce((sum, p) => sum + p.ops, 0) / confirmedHitters.length;
+
+    res.json({ opsDelta: confirmedAvgOps - rosterAvgOps, confirmedCount: confirmedHitters.length, rosterCount: rosterHitters.length });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
