@@ -2016,3 +2016,237 @@ app.get("/api/team/:code/lineup-strength", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ==========================================================================
+// ---- NFL: Backtesting de probabilidad de ganar ----
+// ==========================================================================
+
+app.post("/api/nfl/predictions/save", async (req, res) => {
+  const { game_date, week, home_code, away_code, home_win_prob } = req.body || {};
+  if (!game_date || !home_code || !away_code || home_win_prob == null) {
+    return res.status(400).json({ error: "Faltan datos requeridos" });
+  }
+  try {
+    const checkUrl = `${SUPABASE_URL}/rest/v1/nfl_predictions?game_date=eq.${game_date}&home_code=eq.${home_code}&away_code=eq.${away_code}&select=id`;
+    const existing = await fetch(checkUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    if (Array.isArray(existing) && existing.length > 0) {
+      return res.json({ saved: false, reason: "ya existía" });
+    }
+    const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/nfl_predictions`, {
+      method: "POST",
+      headers: { ...supabaseHeaders, Prefer: "return=representation" },
+      body: JSON.stringify([{ game_date, week: week || null, home_code, away_code, home_win_prob }]),
+    });
+    if (!insertRes.ok) {
+      const bodyText = await insertRes.text().catch(() => "(sin cuerpo)");
+      console.error(`[nfl/predictions/save] Supabase insert error ${insertRes.status}:`, bodyText);
+      throw new Error(`Supabase insert error ${insertRes.status}: ${bodyText}`);
+    }
+    res.json({ saved: true });
+  } catch (err) {
+    console.error("[nfl/predictions/save] Error:", err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post("/api/nfl/predictions/check", async (req, res) => {
+  try {
+    const today = todayET();
+    const pendingUrl = `${SUPABASE_URL}/rest/v1/nfl_predictions?checked_at=is.null&game_date=lt.${today}&select=*`;
+    const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+
+    const results = await Promise.all(
+      pending.map(async (pred) => {
+        if (pred.week == null) return false;
+        const events = await cachedFetch(
+          `nfl-games-check-${pred.week}`,
+          `https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week=${pred.week}`,
+          15 * 60 * 1000
+        ).then((d) => d.events || []);
+        const match = events.find((e) => {
+          const comp = e.competitions?.[0];
+          const home = comp?.competitors?.find((c) => c.homeAway === "home");
+          const away = comp?.competitors?.find((c) => c.homeAway === "away");
+          return home?.team?.abbreviation === pred.home_code && away?.team?.abbreviation === pred.away_code && comp?.status?.type?.completed;
+        });
+        if (!match) return false;
+        const comp = match.competitions[0];
+        const home = comp.competitors.find((c) => c.homeAway === "home");
+        const away = comp.competitors.find((c) => c.homeAway === "away");
+        const winner = parseInt(home.score) > parseInt(away.score) ? pred.home_code : pred.away_code;
+
+        await fetch(`${SUPABASE_URL}/rest/v1/nfl_predictions?id=eq.${pred.id}`, {
+          method: "PATCH",
+          headers: supabaseHeaders,
+          body: JSON.stringify({ actual_winner: winner, checked_at: new Date().toISOString() }),
+        });
+        return true;
+      })
+    );
+    const updated = results.filter(Boolean).length;
+    res.json({ checked: pending.length, updated });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get("/api/nfl/predictions/accuracy", async (req, res) => {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/nfl_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
+    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.json({ totalChecked: 0, accuracy: null, brierScore: null, recent: [] });
+    }
+    let correctFavorite = 0;
+    let brierSum = 0;
+    for (const row of rows) {
+      const predictedFavorite = row.home_win_prob >= 0.5 ? row.home_code : row.away_code;
+      if (predictedFavorite === row.actual_winner) correctFavorite++;
+      const actualHomeWon = row.actual_winner === row.home_code ? 1 : 0;
+      brierSum += Math.pow(row.home_win_prob - actualHomeWon, 2);
+    }
+    res.json({
+      totalChecked: rows.length,
+      accuracy: correctFavorite / rows.length,
+      brierScore: brierSum / rows.length,
+      recent: rows.slice(0, 15).map((r) => ({
+        date: r.game_date, home: r.home_code, away: r.away_code,
+        homeWinProb: r.home_win_prob, actualWinner: r.actual_winner,
+      })),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ==========================================================================
+// ---- NFL: Backtesting de Picks del día (equipo + touchdown) ----
+// ==========================================================================
+
+app.post("/api/nfl/picks/save", async (req, res) => {
+  const picks = req.body?.picks;
+  if (!Array.isArray(picks) || picks.length === 0) {
+    return res.status(400).json({ error: "Se esperaba un arreglo 'picks'" });
+  }
+  try {
+    const dateTypeKeys = new Set(picks.map((p) => `${p.pick_date}|${p.pick_type}`));
+    for (const key of dateTypeKeys) {
+      const [pick_date, pick_type] = key.split("|");
+      await fetch(
+        `${SUPABASE_URL}/rest/v1/nfl_daily_picks?pick_date=eq.${pick_date}&pick_type=eq.${pick_type}&checked_at=is.null`,
+        { method: "DELETE", headers: supabaseHeaders }
+      ).catch(() => {});
+    }
+    let saved = 0;
+    for (const p of picks) {
+      const { pick_date, week, pick_type, player_id, player_name, team_code, predicted_prob } = p;
+      if (!pick_date || !pick_type || !player_name || !team_code || predicted_prob == null) continue;
+      const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/nfl_daily_picks`, {
+        method: "POST",
+        headers: { ...supabaseHeaders, Prefer: "return=representation" },
+        body: JSON.stringify([{ pick_date, week: week || null, pick_type, player_id: player_id || null, player_name, team_code, predicted_prob }]),
+      });
+      if (insertRes.ok) saved++;
+    }
+    res.json({ saved });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Revisa resultados reales de picks pendientes — equipo (¿ganó?) y TD
+// (¿anotó?, buscando en el boxscore real del juego). La estructura
+// exacta del boxscore de jugador de ESPN no se pudo confirmar en vivo
+// hoy — si falla, se revisa en otra ronda sin romper nada.
+app.post("/api/nfl/picks/check", async (req, res) => {
+  try {
+    const today = todayET();
+    const pendingUrl = `${SUPABASE_URL}/rest/v1/nfl_daily_picks?checked_at=is.null&pick_date=lt.${today}&select=*`;
+    const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+
+    const results = await Promise.all(
+      pending.map(async (pick) => {
+        if (pick.week == null) return false;
+        const events = await cachedFetch(
+          `nfl-games-check-${pick.week}`,
+          `https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week=${pick.week}`,
+          15 * 60 * 1000
+        ).then((d) => d.events || []);
+
+        const match = events.find((e) => {
+          const comp = e.competitions?.[0];
+          const teamInGame = (comp?.competitors || []).find((c) => c.team?.abbreviation === pick.team_code);
+          return teamInGame && comp?.status?.type?.completed;
+        });
+        if (!match) return false;
+
+        let success = null;
+        if (pick.pick_type === "team") {
+          const comp = match.competitions[0];
+          const teamComp = comp.competitors.find((c) => c.team?.abbreviation === pick.team_code);
+          success = teamComp?.winner === true;
+        } else if (pick.pick_type === "td" && pick.player_id) {
+          try {
+            const summary = await cachedFetch(
+              `nfl-summary-${match.id}`,
+              `https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary?event=${match.id}`,
+              60 * 60 * 1000
+            );
+            const boxPlayers = summary.boxscore?.players || [];
+            let found = false, scoredTd = false;
+            for (const teamBlock of boxPlayers) {
+              for (const statCategory of teamBlock.statistics || []) {
+                for (const athlete of statCategory.athletes || []) {
+                  if (String(athlete.athlete?.id) === String(pick.player_id)) {
+                    found = true;
+                    const labels = (statCategory.labels || []).map((l) => l.toUpperCase());
+                    const stats = athlete.stats || [];
+                    labels.forEach((label, idx) => {
+                      if (label.includes("TD") && parseInt(stats[idx]) > 0) scoredTd = true;
+                    });
+                  }
+                }
+              }
+            }
+            if (found) success = scoredTd;
+          } catch { /* se revisa en otra ronda */ }
+        }
+
+        if (success == null) return false;
+        await fetch(`${SUPABASE_URL}/rest/v1/nfl_daily_picks?id=eq.${pick.id}`, {
+          method: "PATCH",
+          headers: supabaseHeaders,
+          body: JSON.stringify({ actual_success: success, checked_at: new Date().toISOString() }),
+        });
+        return true;
+      })
+    );
+    const updated = results.filter(Boolean).length;
+    res.json({ checked: pending.length, updated });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get("/api/nfl/picks/accuracy", async (req, res) => {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/nfl_daily_picks?checked_at=not.is.null&select=*&order=pick_date.desc`;
+    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    const summarize = (type) => {
+      const filtered = rows.filter((r) => r.pick_type === type);
+      if (filtered.length === 0) return { accuracy: null, total: 0 };
+      const correct = filtered.filter((r) => r.actual_success === true).length;
+      return { accuracy: correct / filtered.length, total: filtered.length };
+    };
+    res.json({
+      teams: summarize("team"),
+      td: summarize("td"),
+      recent: rows.slice(0, 20).map((r) => ({
+        date: r.pick_date, type: r.pick_type, name: r.player_name, team: r.team_code,
+        prob: r.predicted_prob, success: r.actual_success,
+      })),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
