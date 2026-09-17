@@ -2126,8 +2126,10 @@ app.get("/api/nfl/predictions/accuracy", async (req, res) => {
 app.post("/api/nfl/picks/save", async (req, res) => {
   const picks = req.body?.picks;
   if (!Array.isArray(picks) || picks.length === 0) {
+    console.error("[nfl/picks/save] Arreglo de picks vacío o inválido:", JSON.stringify(req.body).slice(0, 300));
     return res.status(400).json({ error: "Se esperaba un arreglo 'picks'" });
   }
+  console.error(`[nfl/picks/save] Recibidos ${picks.length} picks:`, JSON.stringify(picks).slice(0, 500));
   try {
     const dateTypeKeys = new Set(picks.map((p) => `${p.pick_date}|${p.pick_type}`));
     for (const key of dateTypeKeys) {
@@ -2140,13 +2142,21 @@ app.post("/api/nfl/picks/save", async (req, res) => {
     let saved = 0;
     for (const p of picks) {
       const { pick_date, week, pick_type, player_id, player_name, team_code, predicted_prob } = p;
-      if (!pick_date || !pick_type || !player_name || !team_code || predicted_prob == null) continue;
+      if (!pick_date || !pick_type || !player_name || !team_code || predicted_prob == null) {
+        console.error("[nfl/picks/save] Pick descartado por faltarle datos:", JSON.stringify(p));
+        continue;
+      }
       const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/nfl_daily_picks`, {
         method: "POST",
         headers: { ...supabaseHeaders, Prefer: "return=representation" },
         body: JSON.stringify([{ pick_date, week: week || null, pick_type, player_id: player_id || null, player_name, team_code, predicted_prob }]),
       });
-      if (insertRes.ok) saved++;
+      if (insertRes.ok) {
+        saved++;
+      } else {
+        const bodyText = await insertRes.text().catch(() => "(sin cuerpo)");
+        console.error(`[nfl/picks/save] Supabase insert error ${insertRes.status}:`, bodyText);
+      }
     }
     res.json({ saved });
   } catch (err) {
