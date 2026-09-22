@@ -973,6 +973,57 @@ app.get("/api/player/:id/streak", async (req, res) => {
   }
 });
 
+// ---- GET /api/mlb-predictor/:homeCode/:awayCode ----
+// Predictor real de ESPN para MLB — su propio modelo, que ya combina
+// calidad real del abridor, bateo del equipo, y factor de parque.
+// Confirmado real con una consulta directa (campo "gameProjection" por
+// equipo). Se usa como referencia externa independiente junto a nuestro
+// propio modelo de 9+ factores — promediar dos modelos hechos por
+// separado reduce el error de cualquiera de los dos solo ("ensembling",
+// principio estadístico real, no una corazonada). Primero hay que
+// encontrar el ID de evento REAL de ESPN para este partido específico
+// (es un sistema de IDs distinto al gamePk de MLB Stats API), buscando
+// en su scoreboard del día por los códigos de equipo.
+app.get("/api/mlb-predictor/:homeCode/:awayCode", async (req, res) => {
+  const { homeCode, awayCode } = req.params;
+  const date = req.query.date || todayET();
+  try {
+    const dateParam = date.replace(/-/g, "");
+    const scoreboard = await cachedFetch(
+      `espn-mlb-scoreboard-${date}`,
+      `https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard?dates=${dateParam}`,
+      15 * 60 * 1000
+    );
+    const events = scoreboard.events || [];
+    const match = events.find((e) => {
+      const comp = e.competitions?.[0];
+      const home = comp?.competitors?.find((c) => c.homeAway === "home");
+      const away = comp?.competitors?.find((c) => c.homeAway === "away");
+      return home?.team?.abbreviation === homeCode.toUpperCase() && away?.team?.abbreviation === awayCode.toUpperCase();
+    });
+    if (!match) return res.json({ found: false, homeWinProb: null, awayWinProb: null });
+
+    const eventId = match.id;
+    const data = await cachedFetch(
+      `espn-mlb-predictor-${eventId}`,
+      `https://sports.core.api.espn.com/v2/sports/baseball/leagues/mlb/events/${eventId}/competitions/${eventId}/predictor?lang=en&region=us`,
+      6 * 60 * 60 * 1000
+    );
+    const findProj = (side) => {
+      const stats = data?.[side]?.statistics || [];
+      const stat = stats.find((s) => s.name === "gameProjection");
+      return stat?.value != null ? stat.value / 100 : null;
+    };
+    res.json({
+      found: true,
+      homeWinProb: findProj("homeTeam"),
+      awayWinProb: findProj("awayTeam"),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // ---- GET /api/matchup/:homeCode/:awayCode/headtohead ----
 // Récord REAL de enfrentamientos entre estos dos equipos específicos, esta
 // temporada — no es un promedio genérico, es cómo les ha ido de verdad el
