@@ -1610,6 +1610,45 @@ app.get("/api/nfl/team/:teamId/stats", async (req, res) => {
   }
 });
 
+// ---- GET /api/nfl/game/:eventId/fpi ----
+// FPI real de ESPN (Football Power Index) para este partido específico —
+// su propio modelo predictivo, maduro y calibrado con años de fuerza de
+// roster, no solo los 2-3 partidos de esta temporada. Confirmado real con
+// una consulta directa: da margen de victoria esperado y % de victoria
+// por equipo. Se usa como referencia externa para no confiar ciegamente
+// en nuestro propio cálculo cuando hay poca muestra de temporada — mismo
+// principio de regresión que ya usamos en MLB con el BABIP, pero acá
+// regresionando hacia un punto de referencia informado (el FPI) en vez
+// de un neutral 50/50.
+app.get("/api/nfl/game/:eventId/fpi", async (req, res) => {
+  const { eventId } = req.params;
+  const { homeTeamId, awayTeamId } = req.query;
+  if (!homeTeamId || !awayTeamId) {
+    return res.status(400).json({ error: "Se requieren homeTeamId y awayTeamId" });
+  }
+  try {
+    const fetchOne = async (teamId) => {
+      const data = await cachedFetch(
+        `nfl-fpi-${eventId}-${teamId}`,
+        `https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/events/${eventId}/competitions/${eventId}/powerindex/${teamId}`,
+        6 * 60 * 60 * 1000 // 6h — el FPI no cambia mucho durante la semana
+      );
+      const stats = Object.fromEntries((data.stats || []).map((s) => [s.name, s.value]));
+      return {
+        winProb: stats.gameprojection != null ? stats.gameprojection / 100 : null,
+        predPointDiff: stats.teampredptdiff ?? null,
+      };
+    };
+    const [home, away] = await Promise.all([
+      fetchOne(homeTeamId).catch(() => ({ winProb: null, predPointDiff: null })),
+      fetchOne(awayTeamId).catch(() => ({ winProb: null, predPointDiff: null })),
+    ]);
+    res.json({ home, away });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // ---- GET /api/nfl/headtohead/:teamId1/:teamId2 ----
 // Historial real cara a cara entre dos equipos ESTA temporada — en NFL
 // casi siempre son 0 o 1 juegos previos (2 solo si son rivales de
