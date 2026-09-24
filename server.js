@@ -2598,3 +2598,147 @@ app.get("/api/nfl/picks/accuracy", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ==========================================================================
+// ---- NHL — Fase 1 (juegos reales, probabilidad de ganar, fuerza de
+// calendario, récord por división/conferencia). API pública y oficial de
+// la NHL (api-web.nhle.com) — gratuita, sin llave, sin límite de tasa
+// conocido. Sin predictor propio de ESPN para NHL (se verificó en vivo:
+// el endpoint de predictor de ESPN no existe para hockey), así que ese
+// factor simplemente no se usa aquí, en vez de inventarlo. Pendiente para
+// una siguiente fase: portero titular real (el factor más grande en
+// hockey, equivalente al abridor en MLB), Over/Under, y backtesting real
+// guardado en Supabase — todavía no implementados.
+// ==========================================================================
+
+const NHL_API = "https://api-web.nhle.com/v1";
+
+// ---- GET /api/nhl/games ----
+// Juegos reales de una fecha (hoy por defecto), con su tipo real
+// (pretemporada/temporada regular/playoffs) — esto importa mucho ahora
+// mismo: en pretemporada juegan muchos suplentes y prospectos, así que el
+// resultado NO refleja la fuerza real del equipo titular.
+app.get("/api/nhl/games", async (req, res) => {
+  try {
+    const date = req.query.date || todayET();
+    const data = await cachedFetch(`nhl-schedule-${date}`, `${NHL_API}/schedule/${date}`, 15 * 60 * 1000);
+    const day = (data.gameWeek || []).find((d) => d.date === date);
+    const games = (day?.games || []).map((g) => ({
+      id: g.id,
+      gameType: g.gameType, // 1 = pretemporada, 2 = temporada regular, 3 = playoffs
+      isPreseason: g.gameType === 1,
+      startTimeUTC: g.startTimeUTC,
+      venue: g.venue?.default || null,
+      gameState: g.gameState, // FUT | LIVE | OFF (final)
+      awayCode: g.awayTeam?.abbrev,
+      awayName: g.awayTeam?.commonName?.default || g.awayTeam?.abbrev,
+      awayId: g.awayTeam?.id,
+      awayScore: g.awayTeam?.score ?? null,
+      homeCode: g.homeTeam?.abbrev,
+      homeName: g.homeTeam?.commonName?.default || g.homeTeam?.abbrev,
+      homeId: g.homeTeam?.id,
+      homeScore: g.homeTeam?.score ?? null,
+    }));
+    res.json({ date, games });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nhl/standings ----
+// Tabla real de posiciones — récord, % de puntos (la medida real de
+// fuerza en NHL, porque una derrota en tiempo extra/shootout vale medio
+// punto, a diferencia de una derrota en tiempo regular), casa/ruta, y
+// últimos 10, todo directo de la API oficial de NHL (no hay que calcularlo
+// a mano, a diferencia de MLB/NFL). Si la temporada regular 2026-27 aún no
+// arrancó, esto devuelve la última temporada regular completa como
+// referencia real — no inventa ceros ni una tabla vacía.
+app.get("/api/nhl/standings", async (req, res) => {
+  try {
+    const data = await cachedFetch("nhl-standings", `${NHL_API}/standings/now`, 60 * 60 * 1000);
+    const teams = (data.standings || []).map((t) => ({
+      code: t.teamAbbrev?.default,
+      name: t.teamCommonName?.default || t.teamName?.default,
+      wins: t.wins, losses: t.losses, otLosses: t.otLosses,
+      gamesPlayed: t.gamesPlayed,
+      points: t.points, winPctg: t.winPctg, pointPctg: t.pointPctg,
+      goalFor: t.goalFor, goalAgainst: t.goalAgainst, goalDifferential: t.goalDifferential,
+      divisionName: t.divisionName, conferenceName: t.conferenceName,
+      homeWins: t.homeWins, homeLosses: t.homeLosses, homeOtLosses: t.homeOtLosses,
+      roadWins: t.roadWins, roadLosses: t.roadLosses, roadOtLosses: t.roadOtLosses,
+      l10Wins: t.l10Wins, l10Losses: t.l10Losses, l10OtLosses: t.l10OtLosses,
+      streakCode: t.streakCode, streakCount: t.streakCount,
+      seasonId: t.seasonId,
+    }));
+    teams.sort((a, b) => (b.pointPctg ?? 0) - (a.pointPctg ?? 0));
+    res.json({ teams, seasonId: teams[0]?.seasonId ?? null });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nhl/team/:code/schedule-analysis ----
+// Fuerza real de calendario (promedio del % de puntos de los rivales ya
+// enfrentados esta temporada de referencia) + récord real desglosado por
+// la división/conferencia del RIVAL de cada juego — mismo principio que
+// ya usamos en MLB y NFL. Usa la MISMA temporada que reporta
+// /standings/now, así que si la 2026-27 todavía no tiene suficientes
+// juegos reales, cae de forma honesta en la última temporada regular
+// completa, en vez de fallar o devolver un número vacío.
+app.get("/api/nhl/team/:code/schedule-analysis", async (req, res) => {
+  const code = req.params.code.toUpperCase();
+  try {
+    const standingsData = await cachedFetch("nhl-standings", `${NHL_API}/standings/now`, 60 * 60 * 1000);
+    const teams = standingsData.standings || [];
+    const seasonId = teams[0]?.seasonId;
+    if (!seasonId) return res.status(502).json({ error: "No se pudo determinar la temporada real de referencia" });
+
+    const infoByCode = {};
+    for (const t of teams) {
+      const abbrev = t.teamAbbrev?.default;
+      if (!abbrev) continue;
+      infoByCode[abbrev] = { winPctg: t.pointPctg ?? t.winPctg, divisionName: t.divisionName, conferenceName: t.conferenceName };
+    }
+    const own = infoByCode[code] || null;
+
+    const scheduleData = await cachedFetch(
+      `nhl-schedule-season-${code}-${seasonId}`,
+      `${NHL_API}/club-schedule-season/${code}/${seasonId}`,
+      60 * 60 * 1000
+    );
+    const games = (scheduleData.games || []).filter((g) => g.gameType === 2 && g.gameState === "OFF");
+
+    let sosSum = 0, sosCount = 0;
+    const recordByDivision = {};
+    const recordByConference = { sameConference: { w: 0, l: 0 }, interconference: { w: 0, l: 0 } };
+
+    for (const g of games) {
+      const isHome = g.homeTeam?.abbrev === code;
+      const self = isHome ? g.homeTeam : g.awayTeam;
+      const opp = isHome ? g.awayTeam : g.homeTeam;
+      if (self?.score == null || opp?.score == null || self.score === opp.score) continue; // la NHL no tiene empates reales (se define en OT/shootout)
+      const won = self.score > opp.score;
+      const bucket = won ? "w" : "l";
+
+      const oppInfo = infoByCode[opp.abbrev];
+      if (oppInfo?.winPctg != null) { sosSum += oppInfo.winPctg; sosCount++; }
+      if (oppInfo?.divisionName) {
+        if (!recordByDivision[oppInfo.divisionName]) recordByDivision[oppInfo.divisionName] = { name: oppInfo.divisionName, w: 0, l: 0 };
+        recordByDivision[oppInfo.divisionName][bucket]++;
+        if (own && oppInfo.conferenceName === own.conferenceName) recordByConference.sameConference[bucket]++;
+        else recordByConference.interconference[bucket]++;
+      }
+    }
+
+    res.json({
+      avgOpponentWinPct: sosCount > 0 ? sosSum / sosCount : null,
+      gamesPlayed: sosCount,
+      recordByDivision, recordByConference,
+      ownDivisionName: own?.divisionName ?? null,
+      ownConferenceName: own?.conferenceName ?? null,
+      seasonId,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
