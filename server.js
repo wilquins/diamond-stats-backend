@@ -1581,6 +1581,9 @@ async function getNflDivisionMap() {
   const teamsUrl = (id) =>
     `https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/seasons/${season}/types/2/groups/${id}/teams?lang=en&region=us`;
 
+  // Todo esto se dispara EN PARALELO (conferencias, sus hijos, y las 8
+  // divisiones con su nombre + equipos) — antes iba secuencial y por eso
+  // tardaba varios segundos la primera vez; ahora son ~2 rondas de red.
   const [afc, nfc] = await Promise.all([
     fetch(groupUrl(8)).then((r) => r.json()),
     fetch(groupUrl(7)).then((r) => r.json()),
@@ -1590,22 +1593,32 @@ async function getNflDivisionMap() {
     { id: 7, abbr: nfc.abbreviation || "NFC" },
   ];
 
-  const map = {};
-  for (const conf of conferences) {
-    const childrenData = await fetch(childrenUrl(conf.id)).then((r) => r.json());
-    const divisionIds = (childrenData.items || [])
+  const childrenByConf = await Promise.all(
+    conferences.map((conf) => fetch(childrenUrl(conf.id)).then((r) => r.json()).then((data) => ({ conf, data })))
+  );
+
+  const divisionJobs = [];
+  for (const { conf, data } of childrenByConf) {
+    const divisionIds = (data.items || [])
       .map((it) => it.$ref?.match(/groups\/(\d+)\?/)?.[1])
       .filter(Boolean);
-    for (const divId of divisionIds) {
-      const [divInfo, teamsList] = await Promise.all([
-        fetch(groupUrl(divId)).then((r) => r.json()),
-        fetch(teamsUrl(divId)).then((r) => r.json()),
-      ]);
-      for (const t of teamsList.items || []) {
-        const teamId = t.$ref?.match(/teams\/(\d+)\?/)?.[1];
-        if (teamId) {
-          map[teamId] = { conferenceId: conf.id, conference: conf.abbr, divisionId: divId, divisionName: divInfo.name || null };
-        }
+    for (const divId of divisionIds) divisionJobs.push({ conf, divId });
+  }
+
+  const divisionResults = await Promise.all(
+    divisionJobs.map(({ conf, divId }) =>
+      Promise.all([fetch(groupUrl(divId)).then((r) => r.json()), fetch(teamsUrl(divId)).then((r) => r.json())]).then(
+        ([divInfo, teamsList]) => ({ conf, divId, divInfo, teamsList })
+      )
+    )
+  );
+
+  const map = {};
+  for (const { conf, divId, divInfo, teamsList } of divisionResults) {
+    for (const t of teamsList.items || []) {
+      const teamId = t.$ref?.match(/teams\/(\d+)\?/)?.[1];
+      if (teamId) {
+        map[teamId] = { conferenceId: conf.id, conference: conf.abbr, divisionId: divId, divisionName: divInfo.name || null };
       }
     }
   }
