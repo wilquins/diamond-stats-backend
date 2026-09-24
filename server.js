@@ -2844,3 +2844,195 @@ app.get("/api/nhl/goalies/:homeCode/:awayCode", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ==========================================================================
+// ---- NHL: Backtesting real — mismo principio que ya usamos en MLB/NFL:
+// se guarda la predicción ANTES de saberse el resultado, y se revisa
+// después contra el marcador real de la API oficial de NHL (no ESPN aquí
+// — ya tenemos el resultado real directo de la misma fuente que usamos
+// para /api/nhl/games, sin necesidad de una segunda fuente). Los juegos
+// de pretemporada NO se guardan (el frontend los filtra antes de llamar a
+// /save) porque no miden nada real sobre la fuerza real del equipo
+// titular.
+// ==========================================================================
+
+// ---- POST /api/nhl/predictions/save ----
+app.post("/api/nhl/predictions/save", async (req, res) => {
+  const { game_date, home_code, away_code, home_win_prob } = req.body || {};
+  if (!game_date || !home_code || !away_code || home_win_prob == null) {
+    return res.status(400).json({ error: "Faltan datos requeridos" });
+  }
+  try {
+    const checkUrl = `${SUPABASE_URL}/rest/v1/nhl_predictions?game_date=eq.${game_date}&home_code=eq.${home_code}&away_code=eq.${away_code}&select=id`;
+    const existing = await fetch(checkUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    if (Array.isArray(existing) && existing.length > 0) {
+      return res.json({ saved: false, reason: "ya existía" });
+    }
+    const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/nhl_predictions`, {
+      method: "POST",
+      headers: { ...supabaseHeaders, Prefer: "return=representation" },
+      body: JSON.stringify([{ game_date, home_code, away_code, home_win_prob }]),
+    });
+    if (!insertRes.ok) {
+      const bodyText = await insertRes.text().catch(() => "(sin cuerpo)");
+      console.error(`[nhl/predictions/save] Supabase insert error ${insertRes.status}:`, bodyText);
+      throw new Error(`Supabase insert error ${insertRes.status}: ${bodyText}`);
+    }
+    res.json({ saved: true });
+  } catch (err) {
+    console.error("[nhl/predictions/save] Error:", err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- POST /api/nhl/predictions/check ----
+app.post("/api/nhl/predictions/check", async (req, res) => {
+  try {
+    const today = todayET();
+    const pendingUrl = `${SUPABASE_URL}/rest/v1/nhl_predictions?checked_at=is.null&game_date=lt.${today}&select=*`;
+    const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+
+    const results = await Promise.all(
+      pending.map(async (pred) => {
+        const data = await cachedFetch(`nhl-schedule-${pred.game_date}`, `${NHL_API}/schedule/${pred.game_date}`, 15 * 60 * 1000);
+        const day = (data.gameWeek || []).find((d) => d.date === pred.game_date);
+        const match = (day?.games || []).find(
+          (g) => g.homeTeam?.abbrev === pred.home_code && g.awayTeam?.abbrev === pred.away_code && g.gameState === "OFF"
+        );
+        if (!match) return false;
+        const winner = match.homeTeam.score > match.awayTeam.score ? pred.home_code : pred.away_code;
+
+        await fetch(`${SUPABASE_URL}/rest/v1/nhl_predictions?id=eq.${pred.id}`, {
+          method: "PATCH",
+          headers: supabaseHeaders,
+          body: JSON.stringify({ actual_winner: winner, checked_at: new Date().toISOString() }),
+        });
+        return true;
+      })
+    );
+    const updated = results.filter(Boolean).length;
+    res.json({ checked: pending.length, updated });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nhl/predictions/accuracy ----
+app.get("/api/nhl/predictions/accuracy", async (req, res) => {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/nhl_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
+    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.json({ totalChecked: 0, accuracy: null, brierScore: null, recent: [] });
+    }
+    let correctFavorite = 0;
+    let brierSum = 0;
+    for (const row of rows) {
+      const predictedFavorite = row.home_win_prob >= 0.5 ? row.home_code : row.away_code;
+      if (predictedFavorite === row.actual_winner) correctFavorite++;
+      const actualHomeWon = row.actual_winner === row.home_code ? 1 : 0;
+      brierSum += Math.pow(row.home_win_prob - actualHomeWon, 2);
+    }
+    res.json({
+      totalChecked: rows.length,
+      accuracy: correctFavorite / rows.length,
+      brierScore: brierSum / rows.length,
+      recent: rows.slice(0, 15).map((r) => ({
+        date: r.game_date, home: r.home_code, away: r.away_code,
+        homeWinProb: r.home_win_prob, actualWinner: r.actual_winner,
+      })),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- POST /api/nhl/overunder/save ----
+app.post("/api/nhl/overunder/save", async (req, res) => {
+  const { game_date, home_code, away_code, line, over_prob, expected_total } = req.body || {};
+  if (!game_date || !home_code || !away_code || line == null || over_prob == null || expected_total == null) {
+    return res.status(400).json({ error: "Faltan datos requeridos" });
+  }
+  try {
+    const checkUrl = `${SUPABASE_URL}/rest/v1/nhl_overunder_predictions?game_date=eq.${game_date}&home_code=eq.${home_code}&away_code=eq.${away_code}&select=id`;
+    const existing = await fetch(checkUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    if (Array.isArray(existing) && existing.length > 0) {
+      return res.json({ saved: false, reason: "ya existía" });
+    }
+    const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/nhl_overunder_predictions`, {
+      method: "POST",
+      headers: { ...supabaseHeaders, Prefer: "return=representation" },
+      body: JSON.stringify([{ game_date, home_code, away_code, line, over_prob, expected_total }]),
+    });
+    if (!insertRes.ok) {
+      const bodyText = await insertRes.text().catch(() => "(sin cuerpo)");
+      console.error(`[nhl/overunder/save] Supabase insert error ${insertRes.status}:`, bodyText);
+      throw new Error(`Supabase insert error ${insertRes.status}: ${bodyText}`);
+    }
+    res.json({ saved: true });
+  } catch (err) {
+    console.error("[nhl/overunder/save] Error:", err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- POST /api/nhl/overunder/check ----
+app.post("/api/nhl/overunder/check", async (req, res) => {
+  try {
+    const today = todayET();
+    const pendingUrl = `${SUPABASE_URL}/rest/v1/nhl_overunder_predictions?checked_at=is.null&game_date=lt.${today}&select=*`;
+    const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+
+    const results = await Promise.all(
+      pending.map(async (pred) => {
+        const data = await cachedFetch(`nhl-schedule-${pred.game_date}`, `${NHL_API}/schedule/${pred.game_date}`, 15 * 60 * 1000);
+        const day = (data.gameWeek || []).find((d) => d.date === pred.game_date);
+        const match = (day?.games || []).find(
+          (g) => g.homeTeam?.abbrev === pred.home_code && g.awayTeam?.abbrev === pred.away_code && g.gameState === "OFF"
+        );
+        if (!match) return false;
+        const totalGoals = match.homeTeam.score + match.awayTeam.score;
+        const result = totalGoals > pred.line ? "over" : totalGoals < pred.line ? "under" : "push";
+
+        await fetch(`${SUPABASE_URL}/rest/v1/nhl_overunder_predictions?id=eq.${pred.id}`, {
+          method: "PATCH",
+          headers: supabaseHeaders,
+          body: JSON.stringify({ actual_total_goals: totalGoals, actual_result: result, checked_at: new Date().toISOString() }),
+        });
+        return true;
+      })
+    );
+    const updated = results.filter(Boolean).length;
+    res.json({ checked: pending.length, updated });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nhl/overunder/accuracy ----
+app.get("/api/nhl/overunder/accuracy", async (req, res) => {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/nhl_overunder_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
+    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.json({ totalChecked: 0, accuracy: null, recent: [] });
+    }
+    const decisive = rows.filter((r) => r.actual_result !== "push");
+    let correct = 0;
+    for (const r of decisive) {
+      const predictedSide = r.over_prob >= 0.5 ? "over" : "under";
+      if (predictedSide === r.actual_result) correct++;
+    }
+    res.json({
+      totalChecked: decisive.length,
+      accuracy: decisive.length > 0 ? correct / decisive.length : null,
+      recent: rows.slice(0, 15).map((r) => ({
+        date: r.game_date, home: r.home_code, away: r.away_code,
+        line: r.line, overProb: r.over_prob, expectedTotal: r.expected_total,
+        actualTotalGoals: r.actual_total_goals, actualResult: r.actual_result,
+      })),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
