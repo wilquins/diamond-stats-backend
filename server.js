@@ -42,6 +42,14 @@ const supabaseHeaders = {
   "Content-Type": "application/json",
 };
 
+// Nombres reales de las 6 divisiones de MLB, por su id oficial en la
+// MLB Stats API (confirmado en vivo vía /standings?leagueId=103,104).
+const MLB_DIVISION_NAMES = {
+  200: "AL Oeste", 201: "AL Este", 202: "AL Central",
+  203: "NL Oeste", 204: "NL Este", 205: "NL Central",
+};
+const MLB_LEAGUE_NAMES = { 103: "Liga Americana", 104: "Liga Nacional" };
+
 // IDs oficiales de los 30 equipos en la MLB Stats API
 const TEAM_IDS = {
   ARI: 109, ATL: 144, BAL: 110, BOS: 111, CHC: 112, CWS: 145, CIN: 113,
@@ -611,11 +619,25 @@ app.get("/api/team/:code/situational", async (req, res) => {
 
   try {
     const season = new Date().getFullYear();
-    const data = await cachedFetch(
-      `situational-${teamId}-${season}`,
-      `${MLB_API}/schedule?sportId=1&teamId=${teamId}&season=${season}&gameType=R&hydrate=team`,
-      60 * 60 * 1000 // 1 hora — el calendario/resultados no cambian a cada rato
-    );
+    const [data, standingsData] = await Promise.all([
+      cachedFetch(
+        `situational-${teamId}-${season}`,
+        `${MLB_API}/schedule?sportId=1&teamId=${teamId}&season=${season}&gameType=R&hydrate=team`,
+        60 * 60 * 1000 // 1 hora — el calendario/resultados no cambian a cada rato
+      ),
+      // Mismo caché "standings" que ya usan /api/standings y /strength-of-schedule.
+      cachedFetch("standings", `${MLB_API}/standings?leagueId=103,104&season=${season}`),
+    ]);
+
+    // Mapa real equipo → división/liga, sacado de los 6 grupos de standings
+    // (no es una tabla adivinada — viene de la MLB Stats API en vivo).
+    const teamDivision = {};
+    for (const record of standingsData.records || []) {
+      for (const t of record.teamRecords) {
+        teamDivision[t.team.id] = { divisionId: record.division.id, leagueId: record.league.id };
+      }
+    }
+    const own = teamDivision[teamId] || null;
 
     const games = (data.dates || []).flatMap((d) => d.games).filter((g) => g.status?.abstractGameState === "Final");
     // Ordenamos por fecha real, del más viejo al más reciente — necesario
@@ -685,7 +707,38 @@ app.get("/api/team/:code/situational", async (req, res) => {
       (isHome ? homeRecord : awayRecord)[won ? "w" : "l"]++;
     }
 
-    res.json({ updated: new Date().toISOString(), season, dayRecord, nightRecord, byWeekday, last10Record, currentStreak, homeRecord, awayRecord });
+    // Récord real desglosado por la división del RIVAL de cada juego, y por
+    // si ese rival es de la misma liga (intraliga) o de la otra (interliga).
+    // Esto es lo que permite responder, para el partido de hoy específico,
+    // "¿cómo le ha ido de verdad contra la división de su rival de hoy?" —
+    // en vez de solo su récord general, que puede venir inflado o deflado
+    // por jugar mucho contra una división floja o dura.
+    const recordByDivision = {};
+    const recordByLeague = { sameLeague: { w: 0, l: 0 }, interleague: { w: 0, l: 0 } };
+    for (const g of games) {
+      const isHome = g.teams.home.team.id === teamId;
+      const won = isHome ? g.teams.home.isWinner : g.teams.away.isWinner;
+      if (won == null) continue;
+      const opponentId = isHome ? g.teams.away.team.id : g.teams.home.team.id;
+      const opp = teamDivision[opponentId];
+      if (!opp) continue;
+      const bucket = won ? "w" : "l";
+      if (!recordByDivision[opp.divisionId]) {
+        recordByDivision[opp.divisionId] = { name: MLB_DIVISION_NAMES[opp.divisionId] || `División ${opp.divisionId}`, w: 0, l: 0 };
+      }
+      recordByDivision[opp.divisionId][bucket]++;
+      if (own && opp.leagueId === own.leagueId) recordByLeague.sameLeague[bucket]++;
+      else recordByLeague.interleague[bucket]++;
+    }
+
+    res.json({
+      updated: new Date().toISOString(), season, dayRecord, nightRecord, byWeekday, last10Record, currentStreak,
+      homeRecord, awayRecord, recordByDivision, recordByLeague,
+      ownDivisionId: own?.divisionId ?? null,
+      ownDivisionName: own ? (MLB_DIVISION_NAMES[own.divisionId] || null) : null,
+      ownLeagueId: own?.leagueId ?? null,
+      ownLeagueName: own ? (MLB_LEAGUE_NAMES[own.leagueId] || null) : null,
+    });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -1509,6 +1562,57 @@ app.get("/api/overunder/accuracy", async (req, res) => {
 const ESPN_NFL_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard";
 const ESPN_NFL_STANDINGS = "https://site.api.espn.com/apis/v2/sports/football/nfl/standings?seasontype=2";
 
+// Mapa real equipo → división/conferencia de NFL, construido en vivo desde
+// la jerarquía oficial de grupos de la ESPN Core API (conferencia → 4
+// divisiones cada una → equipos de cada división). No es una tabla
+// adivinada de memoria — se arma con IDs reales de ESPN, y se cachea 24h
+// porque la alineación de divisiones no cambia durante la temporada.
+async function getNflDivisionMap() {
+  const cacheKey = "nfl-division-map";
+  const ttlMs = 24 * 60 * 60 * 1000;
+  const hit = cache.get(cacheKey);
+  if (hit && Date.now() - hit.time < ttlMs) return hit.data;
+
+  const season = new Date().getFullYear();
+  const groupUrl = (id) =>
+    `https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/seasons/${season}/types/2/groups/${id}?lang=en&region=us`;
+  const childrenUrl = (id) =>
+    `https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/seasons/${season}/types/2/groups/${id}/children?limit=50`;
+  const teamsUrl = (id) =>
+    `https://sports.core.api.espn.com/v2/sports/football/leagues/nfl/seasons/${season}/types/2/groups/${id}/teams?lang=en&region=us`;
+
+  const [afc, nfc] = await Promise.all([
+    fetch(groupUrl(8)).then((r) => r.json()),
+    fetch(groupUrl(7)).then((r) => r.json()),
+  ]);
+  const conferences = [
+    { id: 8, abbr: afc.abbreviation || "AFC" },
+    { id: 7, abbr: nfc.abbreviation || "NFC" },
+  ];
+
+  const map = {};
+  for (const conf of conferences) {
+    const childrenData = await fetch(childrenUrl(conf.id)).then((r) => r.json());
+    const divisionIds = (childrenData.items || [])
+      .map((it) => it.$ref?.match(/groups\/(\d+)\?/)?.[1])
+      .filter(Boolean);
+    for (const divId of divisionIds) {
+      const [divInfo, teamsList] = await Promise.all([
+        fetch(groupUrl(divId)).then((r) => r.json()),
+        fetch(teamsUrl(divId)).then((r) => r.json()),
+      ]);
+      for (const t of teamsList.items || []) {
+        const teamId = t.$ref?.match(/teams\/(\d+)\?/)?.[1];
+        if (teamId) {
+          map[teamId] = { conferenceId: conf.id, conference: conf.abbr, divisionId: divId, divisionName: divInfo.name || null };
+        }
+      }
+    }
+  }
+  cache.set(cacheKey, { data: map, time: Date.now() });
+  return map;
+}
+
 // ---- GET /api/nfl/games ----
 // Calendario real de la semana actual de NFL (o la semana que se pida),
 // con marcador y estado real de cada partido.
@@ -2009,13 +2113,27 @@ app.get("/api/nfl/team/:teamId/home-away-record", async (req, res) => {
   // récord real.
   const REGULAR_SEASON_START = new Date("2026-09-09T00:00:00Z");
   try {
-    const data = await cachedFetch(
-      `nfl-schedule-${teamId}-${season}`,
-      `https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${teamId}/schedule?season=${season}`,
-      60 * 60 * 1000
-    );
+    const [data, divisionMap] = await Promise.all([
+      cachedFetch(
+        `nfl-schedule-${teamId}-${season}`,
+        `https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${teamId}/schedule?season=${season}`,
+        60 * 60 * 1000
+      ),
+      getNflDivisionMap(),
+    ]);
     const homeRecord = { w: 0, l: 0 };
     const awayRecord = { w: 0, l: 0 };
+
+    // Récord real desglosado por la división del RIVAL de cada juego, y por
+    // si ese rival es de la misma conferencia o de la otra — mismo espíritu
+    // que el desglose por división de MLB, para responder "¿cómo le ha ido
+    // de verdad contra la división del rival de hoy?" en vez de solo su
+    // récord general (que puede estar inflado/deflado por jugar mucho
+    // contra su propia división, floja o dura).
+    const recordByDivision = {};
+    const recordByConference = { sameConference: { w: 0, l: 0 }, interconference: { w: 0, l: 0 } };
+    const own = divisionMap[teamId] || null;
+
     for (const e of data.events || []) {
       const comp = e.competitions?.[0];
       if (!comp?.status?.type?.completed || new Date(e.date) < REGULAR_SEASON_START) continue;
@@ -2023,8 +2141,26 @@ app.get("/api/nfl/team/:teamId/home-away-record", async (req, res) => {
       if (!self || self.winner == null) continue;
       const bucket = self.winner ? "w" : "l";
       (self.homeAway === "home" ? homeRecord : awayRecord)[bucket]++;
+
+      const opponent = comp.competitors?.find((c) => c.id !== teamId);
+      const opp = opponent ? divisionMap[opponent.id] : null;
+      if (opp) {
+        if (!recordByDivision[opp.divisionId]) {
+          recordByDivision[opp.divisionId] = { name: opp.divisionName || `División ${opp.divisionId}`, w: 0, l: 0 };
+        }
+        recordByDivision[opp.divisionId][bucket]++;
+        if (own && opp.conferenceId === own.conferenceId) recordByConference.sameConference[bucket]++;
+        else recordByConference.interconference[bucket]++;
+      }
     }
-    res.json({ homeRecord, awayRecord });
+
+    res.json({
+      homeRecord, awayRecord, recordByDivision, recordByConference,
+      ownDivisionId: own?.divisionId ?? null,
+      ownDivisionName: own?.divisionName ?? null,
+      ownConferenceId: own?.conferenceId ?? null,
+      ownConference: own?.conference ?? null,
+    });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
