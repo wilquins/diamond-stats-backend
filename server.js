@@ -2659,6 +2659,7 @@ app.get("/api/nhl/standings", async (req, res) => {
     const teams = (data.standings || []).map((t) => ({
       code: t.teamAbbrev?.default,
       name: t.teamCommonName?.default || t.teamName?.default,
+      fullName: t.teamName?.default || null, // nombre completo real (ej. "Toronto Maple Leafs") — necesario para emparejar con el evento de ESPN al buscar el portero titular
       wins: t.wins, losses: t.losses, otLosses: t.otLosses,
       gamesPlayed: t.gamesPlayed,
       points: t.points, winPctg: t.winPctg, pointPctg: t.pointPctg,
@@ -2737,6 +2738,107 @@ app.get("/api/nhl/team/:code/schedule-analysis", async (req, res) => {
       ownDivisionName: own?.divisionName ?? null,
       ownConferenceName: own?.conferenceName ?? null,
       seasonId,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ==========================================================================
+// ---- NHL — Fase 2: portero titular real + Over/Under ----
+// La NHL oficial NO publica el portero titular confirmado antes del
+// partido (se verificó en vivo); ESPN sí lo hace (campo "probables", con
+// estado Confirmed/Expected), así que se usa ESPN solo para ESO — el
+// nombre y si está confirmado o solo se espera — y luego se busca a ese
+// portero en las estadísticas REALES y oficiales de la NHL de su propio
+// equipo (mismo principio que ya usamos: nunca inventar un número,
+// siempre cruzar con la fuente oficial). Los eventos de ESPN y NHL usan
+// IDs de equipo distintos, así que se emparejan por el nombre completo
+// real del equipo (ej. "Toronto Maple Leafs"), no por abreviación —
+// varias abreviaciones no coinciden entre las dos APIs (NJ vs NJD, LA vs
+// LAK, etc.), y esto evita ese problema de raíz.
+// ==========================================================================
+
+// Save % promedio real de la liga en la temporada 2023-24 (.903) — fuente:
+// StatMuse, sobre 79,025 tiros reales de toda la NHL
+// (https://www.statmuse.com/nhl/ask/nhl-league-average-goalie-save-percentage-in-2024).
+// Se usa como línea base para medir qué tan bueno/malo es un portero
+// específico, igual que ya hacemos con el ERA promedio de liga en MLB.
+const NHL_LEAGUE_AVG_SAVE_PCT = 0.903;
+
+async function findEspnProbableGoalie(homeFullName, awayFullName, date) {
+  const dateParam = date.replace(/-/g, "");
+  const scoreboard = await cachedFetch(
+    `espn-nhl-scoreboard-${date}`,
+    `https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard?dates=${dateParam}`,
+    15 * 60 * 1000
+  );
+  const events = scoreboard.events || [];
+  const norm = (s) => (s || "").toLowerCase().trim();
+  const match = events.find((e) => {
+    const comp = e.competitions?.[0];
+    const names = (comp?.competitors || []).map((c) => norm(c.team?.displayName));
+    return names.includes(norm(homeFullName)) && names.includes(norm(awayFullName));
+  });
+  if (!match) return { home: null, away: null };
+
+  const comp = match.competitions[0];
+  const getProbable = (homeAway) => {
+    const competitor = comp.competitors.find((c) => c.homeAway === homeAway);
+    const probable = (competitor?.probables || []).find((p) => p.name === "probableStartingGoalie");
+    if (!probable) return null;
+    return { name: probable.athlete?.fullName || null, status: probable.status?.name || null };
+  };
+  return { home: getProbable("home"), away: getProbable("away") };
+}
+
+async function getRealGoalieStats(code, seasonId, goalieName) {
+  if (!goalieName) return null;
+  const data = await cachedFetch(
+    `nhl-club-stats-${code}-${seasonId}`,
+    `${NHL_API}/club-stats/${code}/${seasonId}/2`,
+    60 * 60 * 1000
+  );
+  const norm = (s) => (s || "").toLowerCase().trim();
+  const target = norm(goalieName);
+  const found = (data.goalies || []).find((g) => {
+    const full = `${g.firstName?.default || ""} ${g.lastName?.default || ""}`;
+    return norm(full) === target || target.includes(norm(g.lastName?.default));
+  });
+  if (!found) return null;
+  return {
+    name: `${found.firstName?.default || ""} ${found.lastName?.default || ""}`.trim(),
+    gamesPlayed: found.gamesPlayed ?? null,
+    savePercentage: found.savePercentage ?? null,
+    goalsAgainstAverage: found.goalsAgainstAverage ?? null,
+    wins: found.wins ?? null,
+    losses: found.losses ?? null,
+  };
+}
+
+// ---- GET /api/nhl/goalies/:homeCode/:awayCode ----
+app.get("/api/nhl/goalies/:homeCode/:awayCode", async (req, res) => {
+  const homeCode = req.params.homeCode.toUpperCase();
+  const awayCode = req.params.awayCode.toUpperCase();
+  const date = req.query.date || todayET();
+  const { homeName, awayName } = req.query;
+  if (!homeName || !awayName) {
+    return res.status(400).json({ error: "Se requieren homeName y awayName (nombre completo real del equipo) para emparejar con ESPN" });
+  }
+  try {
+    const standingsData = await cachedFetch("nhl-standings", `${NHL_API}/standings/now`, 60 * 60 * 1000);
+    const seasonId = standingsData.standings?.[0]?.seasonId;
+    if (!seasonId) return res.status(502).json({ error: "No se pudo determinar la temporada real de referencia" });
+
+    const probables = await findEspnProbableGoalie(homeName, awayName, date);
+    const [homeStats, awayStats] = await Promise.all([
+      getRealGoalieStats(homeCode, seasonId, probables.home?.name).catch(() => null),
+      getRealGoalieStats(awayCode, seasonId, probables.away?.name).catch(() => null),
+    ]);
+
+    res.json({
+      home: probables.home ? { ...probables.home, stats: homeStats } : null,
+      away: probables.away ? { ...probables.away, stats: awayStats } : null,
     });
   } catch (err) {
     res.status(502).json({ error: err.message });
