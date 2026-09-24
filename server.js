@@ -973,6 +973,56 @@ app.get("/api/player/:id/streak", async (req, res) => {
   }
 });
 
+// ---- GET /api/team/:code/strength-of-schedule ----
+// Fuerza real del calendario jugado esta temporada — el promedio del
+// win% ACTUAL (de hoy, no de cuando se jugó cada partido) de todos los
+// rivales que este equipo ya enfrentó. Un equipo puede tener buen récord
+// solo por jugar mucho contra su propia división si esta es floja, o
+// verse "peor" de lo que es por jugar seguido contra rivales fuertes de
+// otras divisiones — esto corrige esa distorsión real, sin adivinar,
+// contando partido por partido contra quién jugó de verdad.
+app.get("/api/team/:code/strength-of-schedule", async (req, res) => {
+  const teamId = TEAM_IDS[req.params.code.toUpperCase()];
+  if (!teamId) return res.status(404).json({ error: "Código de equipo no reconocido" });
+
+  try {
+    const season = new Date().getFullYear();
+    const [scheduleData, standingsData] = await Promise.all([
+      // Mismo caché que ya usa /situational — mismos datos crudos, no se
+      // repite la llamada a la MLB API.
+      cachedFetch(
+        `situational-${teamId}-${season}`,
+        `${MLB_API}/schedule?sportId=1&teamId=${teamId}&season=${season}&gameType=R&hydrate=team`,
+        60 * 60 * 1000
+      ),
+      cachedFetch("standings", `${MLB_API}/standings?leagueId=103,104&season=${season}`),
+    ]);
+
+    const wpctByTeamId = {};
+    for (const record of standingsData.records) {
+      for (const t of record.teamRecords) wpctByTeamId[t.team.id] = parseFloat(t.winningPercentage);
+    }
+
+    const games = (scheduleData.dates || [])
+      .flatMap((d) => d.games)
+      .filter((g) => g.status?.abstractGameState === "Final");
+
+    let sum = 0, count = 0;
+    for (const g of games) {
+      const opponentId = g.teams.home.team.id === teamId ? g.teams.away.team.id : g.teams.home.team.id;
+      const oppWpct = wpctByTeamId[opponentId];
+      if (oppWpct != null) { sum += oppWpct; count++; }
+    }
+
+    res.json({
+      avgOpponentWinPct: count > 0 ? sum / count : null,
+      gamesPlayed: count,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // ---- GET /api/mlb-predictor/:homeCode/:awayCode ----
 // Predictor real de ESPN para MLB — su propio modelo, que ya combina
 // calidad real del abridor, bateo del equipo, y factor de parque.
@@ -1695,6 +1745,55 @@ app.get("/api/nfl/game/:eventId/fpi", async (req, res) => {
       fetchOne(awayTeamId).catch(() => ({ winProb: null, predPointDiff: null })),
     ]);
     res.json({ home, away });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nfl/team/:teamId/strength-of-schedule ----
+// Mismo principio real que en MLB: promedio del win% ACTUAL de todos los
+// rivales que este equipo ya enfrentó esta temporada, contado partido
+// por partido de su calendario real — no una suposición sobre qué tan
+// dura "debería" ser su división.
+app.get("/api/nfl/team/:teamId/strength-of-schedule", async (req, res) => {
+  const { teamId } = req.params;
+  const season = new Date().getFullYear();
+  const REGULAR_SEASON_START = new Date("2026-09-09T00:00:00Z");
+  try {
+    const [scheduleData, standingsData] = await Promise.all([
+      cachedFetch(
+        `nfl-schedule-${teamId}-${season}`, // mismo caché que ya usa headtohead/home-away-record
+        `https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${teamId}/schedule?season=${season}`,
+        60 * 60 * 1000
+      ),
+      cachedFetch("nfl-standings", ESPN_NFL_STANDINGS, 60 * 60 * 1000),
+    ]);
+
+    const wpctByTeamId = {};
+    for (const conf of standingsData.children || []) {
+      for (const entry of conf.standings?.entries || []) {
+        const statByType = Object.fromEntries((entry.stats || []).map((s) => [s.type, s]));
+        wpctByTeamId[entry.team.id] = statByType.winpercent?.value ?? null;
+      }
+    }
+
+    const games = (scheduleData.events || []).filter((e) => {
+      const comp = e.competitions?.[0];
+      return comp?.status?.type?.completed && new Date(e.date) >= REGULAR_SEASON_START;
+    });
+
+    let sum = 0, count = 0;
+    for (const e of games) {
+      const comp = e.competitions[0];
+      const opponent = comp.competitors?.find((c) => c.id !== teamId);
+      const oppWpct = opponent ? wpctByTeamId[opponent.id] : null;
+      if (oppWpct != null) { sum += oppWpct; count++; }
+    }
+
+    res.json({
+      avgOpponentWinPct: count > 0 ? sum / count : null,
+      gamesPlayed: count,
+    });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
