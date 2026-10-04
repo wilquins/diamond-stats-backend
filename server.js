@@ -3135,7 +3135,12 @@ app.post("/api/nhl/picks/check", async (req, res) => {
   try {
     const today = todayET();
     const pendingUrl = `${SUPABASE_URL}/rest/v1/nhl_daily_picks?checked_at=is.null&pick_date=lt.${today}&select=*`;
-    const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    const pendingRaw = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(pendingRaw)) {
+      console.error("[nhl/picks/check] Respuesta inesperada de Supabase (¿falta la tabla nhl_daily_picks?):", JSON.stringify(pendingRaw).slice(0, 300));
+      return res.json({ checked: 0, updated: 0 });
+    }
+    const pending = pendingRaw;
 
     const results = await Promise.all(
       pending.map(async (pick) => {
@@ -3187,6 +3192,10 @@ app.get("/api/nhl/picks/accuracy", async (req, res) => {
   try {
     const url = `${SUPABASE_URL}/rest/v1/nhl_daily_picks?checked_at=not.is.null&select=*&order=pick_date.desc`;
     const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(rows)) {
+      console.error("[nhl/picks/accuracy] Respuesta inesperada de Supabase (¿falta la tabla nhl_daily_picks?):", JSON.stringify(rows).slice(0, 300));
+      return res.json({ teams: { accuracy: null, total: 0 }, goal: { accuracy: null, total: 0 }, recent: [] });
+    }
     const summarize = (type) => {
       const filtered = rows.filter((r) => r.pick_type === type);
       if (filtered.length === 0) return { accuracy: null, total: 0 };
