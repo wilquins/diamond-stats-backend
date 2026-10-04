@@ -2897,7 +2897,7 @@ app.post("/api/nhl/predictions/check", async (req, res) => {
         const data = await cachedFetch(`nhl-schedule-${pred.game_date}`, `${NHL_API}/schedule/${pred.game_date}`, 15 * 60 * 1000);
         const day = (data.gameWeek || []).find((d) => d.date === pred.game_date);
         const match = (day?.games || []).find(
-          (g) => g.homeTeam?.abbrev === pred.home_code && g.awayTeam?.abbrev === pred.away_code && g.gameState === "OFF"
+          (g) => g.homeTeam?.abbrev === pred.home_code && g.awayTeam?.abbrev === pred.away_code && (g.gameState === "OFF" || g.gameState === "FINAL")
         );
         if (!match) return false;
         const winner = match.homeTeam.score > match.awayTeam.score ? pred.home_code : pred.away_code;
@@ -2988,7 +2988,7 @@ app.post("/api/nhl/overunder/check", async (req, res) => {
         const data = await cachedFetch(`nhl-schedule-${pred.game_date}`, `${NHL_API}/schedule/${pred.game_date}`, 15 * 60 * 1000);
         const day = (data.gameWeek || []).find((d) => d.date === pred.game_date);
         const match = (day?.games || []).find(
-          (g) => g.homeTeam?.abbrev === pred.home_code && g.awayTeam?.abbrev === pred.away_code && g.gameState === "OFF"
+          (g) => g.homeTeam?.abbrev === pred.home_code && g.awayTeam?.abbrev === pred.away_code && (g.gameState === "OFF" || g.gameState === "FINAL")
         );
         if (!match) return false;
         const totalGoals = match.homeTeam.score + match.awayTeam.score;
@@ -3148,7 +3148,7 @@ app.post("/api/nhl/picks/check", async (req, res) => {
         const day = (data.gameWeek || []).find((d) => d.date === pick.pick_date);
         const match = (day?.games || []).find(
           (g) =>
-            g.gameState === "OFF" &&
+            (g.gameState === "OFF" || g.gameState === "FINAL") &&
             (g.homeTeam?.abbrev === pick.team_code || g.awayTeam?.abbrev === pick.team_code)
         );
         if (!match) return false;
@@ -3210,6 +3210,34 @@ app.get("/api/nhl/picks/accuracy", async (req, res) => {
         prob: r.predicted_prob, success: r.actual_success,
       })),
     });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nhl/backtest-status ----
+// Diagnóstico: cuántas predicciones hay realmente guardadas / pendientes
+// de revisar en cada tabla de backtesting de NHL, y si alguna tabla no
+// existe en Supabase (en cuyo caso nada se estaría guardando).
+app.get("/api/nhl/backtest-status", async (req, res) => {
+  const tables = {
+    predictions: "nhl_predictions",
+    overunder: "nhl_overunder_predictions",
+    picks: "nhl_daily_picks",
+  };
+  try {
+    const entries = await Promise.all(
+      Object.entries(tables).map(async ([key, table]) => {
+        try {
+          const rows = await fetch(`${SUPABASE_URL}/rest/v1/${table}?select=id,checked_at`, { headers: supabaseHeaders }).then((r) => r.json());
+          if (!Array.isArray(rows)) return [key, { exists: false, total: 0, pending: 0 }];
+          return [key, { exists: true, total: rows.length, pending: rows.filter((r) => r.checked_at == null).length }];
+        } catch {
+          return [key, { exists: false, total: 0, pending: 0 }];
+        }
+      })
+    );
+    res.json(Object.fromEntries(entries));
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
