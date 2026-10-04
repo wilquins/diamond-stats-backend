@@ -3036,3 +3036,172 @@ app.get("/api/nhl/overunder/accuracy", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ==========================================================================
+// ---- NHL — Picks del día: equipo favorito + goleador real. Mismo
+// principio que ya usamos en NFL (TD) y MLB (jonrón): probabilidad real
+// vía Poisson sobre la tasa de goles por juego REAL de esta temporada —
+// nunca un número inventado. Con la temporada recién empezada (1-2
+// juegos por jugador todavía), esa tasa es ruidosa — se muestra
+// gamesPlayed real para que el usuario vea la muestra con la que se
+// calculó, igual que ya se hace con otras probabilidades tempranas.
+// ==========================================================================
+
+// ---- GET /api/nhl/team/:code/skater-stats ----
+app.get("/api/nhl/team/:code/skater-stats", async (req, res) => {
+  const code = req.params.code.toUpperCase();
+  try {
+    const standingsData = await cachedFetch("nhl-standings", `${NHL_API}/standings/now`, 60 * 60 * 1000);
+    const seasonId = standingsData.standings?.[0]?.seasonId;
+    if (!seasonId) return res.status(502).json({ error: "No se pudo determinar la temporada real de referencia" });
+
+    const data = await cachedFetch(
+      `nhl-club-stats-${code}-${seasonId}`,
+      `${NHL_API}/club-stats/${code}/${seasonId}/2`,
+      60 * 60 * 1000
+    );
+    const skaters = (data.skaters || []).filter((s) => s.positionCode !== "G" && (s.gamesPlayed || 0) > 0);
+
+    const players = skaters.map((s) => {
+      const goalsPerGame = s.goals / s.gamesPlayed;
+      // Probabilidad real de al menos 1 gol vía Poisson — mismo
+      // principio que ya usamos para TD (NFL) y jonrones (MLB).
+      const goalProbability = 1 - Math.exp(-goalsPerGame);
+      return {
+        id: s.playerId,
+        name: `${s.firstName?.default || ""} ${s.lastName?.default || ""}`.trim(),
+        position: s.positionCode,
+        gamesPlayed: s.gamesPlayed,
+        goals: s.goals,
+        goalsPerGame,
+        goalProbability,
+      };
+    });
+
+    res.json({ players });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ==========================================================================
+// ---- NHL: Backtesting de Picks del día (equipo + goleador) — mismo
+// principio que nfl_daily_picks. El resultado de equipo se revisa contra
+// la propia API oficial de NHL (ya tenemos el marcador real ahí). El
+// gol de jugador se revisa contra el boxscore de juego de la NHL
+// (gamecenter/{id}/boxscore) — su estructura exacta de stats por
+// jugador no se pudo confirmar en vivo hoy, así que si falla, se
+// revisa en otra ronda sin romper nada (mismo principio que ya
+// aplicamos en NFL para el TD).
+// ==========================================================================
+
+app.post("/api/nhl/picks/save", async (req, res) => {
+  const picks = req.body?.picks;
+  if (!Array.isArray(picks) || picks.length === 0) {
+    return res.status(400).json({ error: "Se esperaba un arreglo 'picks'" });
+  }
+  try {
+    const dateTypeKeys = new Set(picks.map((p) => `${p.pick_date}|${p.pick_type}`));
+    for (const key of dateTypeKeys) {
+      const [pick_date, pick_type] = key.split("|");
+      await fetch(
+        `${SUPABASE_URL}/rest/v1/nhl_daily_picks?pick_date=eq.${pick_date}&pick_type=eq.${pick_type}&checked_at=is.null`,
+        { method: "DELETE", headers: supabaseHeaders }
+      ).catch(() => {});
+    }
+    let saved = 0;
+    for (const p of picks) {
+      const { pick_date, pick_type, player_id, player_name, team_code, predicted_prob } = p;
+      if (!pick_date || !pick_type || !player_name || !team_code || predicted_prob == null) continue;
+      const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/nhl_daily_picks`, {
+        method: "POST",
+        headers: { ...supabaseHeaders, Prefer: "return=representation" },
+        body: JSON.stringify([{ pick_date, pick_type, player_id: player_id || null, player_name, team_code, predicted_prob }]),
+      });
+      if (insertRes.ok) {
+        saved++;
+      } else {
+        const bodyText = await insertRes.text().catch(() => "(sin cuerpo)");
+        console.error(`[nhl/picks/save] Supabase insert error ${insertRes.status}:`, bodyText);
+      }
+    }
+    res.json({ saved });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post("/api/nhl/picks/check", async (req, res) => {
+  try {
+    const today = todayET();
+    const pendingUrl = `${SUPABASE_URL}/rest/v1/nhl_daily_picks?checked_at=is.null&pick_date=lt.${today}&select=*`;
+    const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+
+    const results = await Promise.all(
+      pending.map(async (pick) => {
+        const data = await cachedFetch(`nhl-schedule-${pick.pick_date}`, `${NHL_API}/schedule/${pick.pick_date}`, 15 * 60 * 1000);
+        const day = (data.gameWeek || []).find((d) => d.date === pick.pick_date);
+        const match = (day?.games || []).find(
+          (g) =>
+            g.gameState === "OFF" &&
+            (g.homeTeam?.abbrev === pick.team_code || g.awayTeam?.abbrev === pick.team_code)
+        );
+        if (!match) return false;
+
+        let success = null;
+        if (pick.pick_type === "team") {
+          const isHome = match.homeTeam?.abbrev === pick.team_code;
+          const teamScore = isHome ? match.homeTeam.score : match.awayTeam.score;
+          const oppScore = isHome ? match.awayTeam.score : match.homeTeam.score;
+          success = teamScore > oppScore;
+        } else if (pick.pick_type === "goal" && pick.player_id) {
+          try {
+            const box = await cachedFetch(`nhl-boxscore-${match.id}`, `${NHL_API}/gamecenter/${match.id}/boxscore`, 60 * 60 * 1000);
+            const stats = box.playerByGameStats || {};
+            const allSkaters = [
+              ...(stats.homeTeam?.forwards || []), ...(stats.homeTeam?.defense || []),
+              ...(stats.awayTeam?.forwards || []), ...(stats.awayTeam?.defense || []),
+            ];
+            const found = allSkaters.find((s) => String(s.playerId) === String(pick.player_id));
+            if (found) success = (found.goals || 0) > 0;
+          } catch { /* se revisa en otra ronda */ }
+        }
+
+        if (success == null) return false;
+        await fetch(`${SUPABASE_URL}/rest/v1/nhl_daily_picks?id=eq.${pick.id}`, {
+          method: "PATCH",
+          headers: supabaseHeaders,
+          body: JSON.stringify({ actual_success: success, checked_at: new Date().toISOString() }),
+        });
+        return true;
+      })
+    );
+    const updated = results.filter(Boolean).length;
+    res.json({ checked: pending.length, updated });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get("/api/nhl/picks/accuracy", async (req, res) => {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/nhl_daily_picks?checked_at=not.is.null&select=*&order=pick_date.desc`;
+    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    const summarize = (type) => {
+      const filtered = rows.filter((r) => r.pick_type === type);
+      if (filtered.length === 0) return { accuracy: null, total: 0 };
+      const correct = filtered.filter((r) => r.actual_success === true).length;
+      return { accuracy: correct / filtered.length, total: filtered.length };
+    };
+    res.json({
+      teams: summarize("team"),
+      goal: summarize("goal"),
+      recent: rows.slice(0, 20).map((r) => ({
+        date: r.pick_date, type: r.pick_type, name: r.player_name, team: r.team_code,
+        prob: r.predicted_prob, success: r.actual_success,
+      })),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
