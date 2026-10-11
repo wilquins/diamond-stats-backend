@@ -3467,16 +3467,28 @@ app.get("/api/nba/team/:id/schedule-analysis", async (req, res) => {
       60 * 60 * 1000
     );
     let sosSum = 0, sosCount = 0;
+    const totals = []; // puntos totales (ambos equipos) de cada juego terminado
     for (const e of sched.events || []) {
       const comp = e.competitions?.[0];
       if (!comp?.status?.type?.completed) continue;
       const opp = (comp.competitors || []).find((c) => String(c.team?.id) !== teamId);
+      const self = (comp.competitors || []).find((c) => String(c.team?.id) === teamId);
       const wp = opp ? winPctById[String(opp.team?.id)] : null;
       if (wp != null) { sosSum += wp; sosCount++; }
+      const a = Number(self?.score?.value ?? self?.score), b = Number(opp?.score?.value ?? opp?.score);
+      if (Number.isFinite(a) && Number.isFinite(b) && a + b > 0) totals.push(a + b);
+    }
+    // Desviación estándar REAL de los totales de este equipo en la
+    // temporada de referencia (medida, no citada) — base del Over/Under.
+    let avgTotal = null, totalSD = null;
+    if (totals.length >= 20) {
+      avgTotal = totals.reduce((x, y) => x + y, 0) / totals.length;
+      totalSD = Math.sqrt(totals.reduce((x, y) => x + Math.pow(y - avgTotal, 2), 0) / (totals.length - 1));
     }
     res.json({
       avgOpponentWinPct: sosCount > 0 ? sosSum / sosCount : null,
       gamesPlayed: sosCount,
+      avgTotal, totalSD, totalGames: totals.length,
       seasonYear, seasonDisplayName,
     });
   } catch (err) {
@@ -3597,9 +3609,206 @@ app.get("/api/nba/predictions/accuracy", async (req, res) => {
 
 app.get("/api/nba/backtest-status", async (req, res) => {
   try {
-    const rows = await fetch(`${SUPABASE_URL}/rest/v1/nba_predictions?select=id,checked_at`, { headers: supabaseHeaders }).then((r) => r.json());
-    if (!Array.isArray(rows)) return res.json({ predictions: { exists: false, total: 0, pending: 0 } });
-    res.json({ predictions: { exists: true, total: rows.length, pending: rows.filter((r) => r.checked_at == null).length } });
+    const summarize = async (table) => {
+      try {
+        const rows = await fetch(`${SUPABASE_URL}/rest/v1/${table}?select=id,checked_at`, { headers: supabaseHeaders }).then((r) => r.json());
+        if (!Array.isArray(rows)) return { exists: false, total: 0, pending: 0 };
+        return { exists: true, total: rows.length, pending: rows.filter((r) => r.checked_at == null).length };
+      } catch {
+        return { exists: false, total: 0, pending: 0 };
+      }
+    };
+    const [predictions, overunder] = await Promise.all([summarize("nba_predictions"), summarize("nba_overunder_predictions")]);
+    res.json({ predictions, overunder });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ==========================================================================
+// ---- NBA — Fase 2: lesiones reales + Over/Under ----
+// Lesiones: reporte real de ESPN (Out / Day-To-Day) cruzado con las
+// estadísticas REALES de cada jugador en la temporada de referencia
+// (minutos por juego y PER, de la API de ESPN). Valor de un jugador:
+// Box Plus/Minus (BPM) en puntos por 100 posesiones sobre el promedio de
+// la liga, con la escala oficial de Basketball-Reference (+8 = MVP, +4 =
+// consideración All-Star, -2 = nivel de reemplazo). ESPN no publica BPM,
+// así que se ESTIMA a partir de PER con una interpolación lineal
+// (PER 15 = promedio = BPM 0; un PER de MVP ~29 = BPM +8 → pendiente
+// ~0.53). Es una aproximación, no un dato oficial: se dice en pantalla.
+// Puntos perdidos por juego ≈ (BPM estimado − (-2)) × (minutos/48), solo
+// si es mejor que reemplazo. (Por 100 posesiones ≈ por juego: el ritmo de
+// la NBA ronda las 100 posesiones.) Peso por estatus: Out = 1.0,
+// Day-To-Day = 0.5 (decisión SUBJETIVA, se evaluará con el backtesting).
+// ==========================================================================
+
+const NBA_PER_TO_BPM_SLOPE = 0.53;
+const NBA_REPLACEMENT_BPM = -2.0; // Basketball-Reference
+const NBA_MIN_GAMES_FOR_PLAYER_STATS = 20; // con menos juegos el PER es muy ruidoso
+
+function extractAthleteId(a) {
+  if (!a) return null;
+  if (a.id) return String(a.id);
+  for (const l of a.links || []) {
+    const m = /\/id\/(\d+)/.exec(l.href || "");
+    if (m) return m[1];
+  }
+  const m2 = /\/(\d+)\.png/.exec(a.headshot?.href || "");
+  return m2 ? m2[1] : null;
+}
+
+async function getNbaPlayerValue(athleteId, seasonYear) {
+  try {
+    const data = await cachedFetch(
+      `nba-player-stats-${athleteId}-${seasonYear}`,
+      `https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba/seasons/${seasonYear}/types/2/athletes/${athleteId}/statistics/0`,
+      60 * 60 * 1000
+    );
+    const stat = (cat, name) => data.splits?.categories?.find((c) => c.name === cat)?.stats?.find((x) => x.name === name)?.value ?? null;
+    return {
+      gamesPlayed: stat("general", "gamesPlayed"),
+      avgMinutes: stat("general", "avgMinutes"),
+      per: stat("general", "PER"),
+      avgPoints: stat("offensive", "avgPoints"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ---- GET /api/nba/game-injuries?homeId=&awayId= ----
+app.get("/api/nba/game-injuries", async (req, res) => {
+  const { homeId, awayId } = req.query;
+  if (!homeId || !awayId) return res.status(400).json({ error: "Se requieren homeId y awayId" });
+  try {
+    const standings = await cachedFetch("nba-standings", `${ESPN_NBA_V2}/standings`, 60 * 60 * 1000);
+    const seasonYear = standings.children?.[0]?.standings?.season;
+    const inj = await cachedFetch("nba-injuries", `${ESPN_NBA_SITE}/injuries`, 10 * 60 * 1000);
+
+    const buildTeam = async (teamId) => {
+      const group = (inj.injuries || []).find((g) => String(g.id) === String(teamId));
+      const entries = (group?.injuries || []).slice(0, 12);
+      const players = await Promise.all(
+        entries.map(async (e) => {
+          const status = e.status || e.type?.description || null; // "Out" | "Day-To-Day"
+          const athleteId = extractAthleteId(e.athlete);
+          const stats = athleteId && seasonYear ? await getNbaPlayerValue(athleteId, seasonYear) : null;
+          const reliable = stats && stats.per != null && stats.avgMinutes != null && (stats.gamesPlayed || 0) >= NBA_MIN_GAMES_FOR_PLAYER_STATS;
+          let lostPoints = 0, bpmEstimate = null;
+          if (reliable) {
+            bpmEstimate = NBA_PER_TO_BPM_SLOPE * (stats.per - 15);
+            const valueOverReplacement = Math.max(0, bpmEstimate - NBA_REPLACEMENT_BPM);
+            const weight = status === "Out" ? 1.0 : status === "Day-To-Day" ? 0.5 : 0;
+            lostPoints = valueOverReplacement * (stats.avgMinutes / 48) * weight;
+          }
+          return {
+            name: e.athlete?.displayName || null,
+            position: e.athlete?.position?.abbreviation || null,
+            status,
+            injury: [e.details?.type, e.details?.detail].filter(Boolean).join(" · ") || null,
+            returnDate: e.details?.returnDate || null,
+            hasStats: !!reliable,
+            gamesPlayed: stats?.gamesPlayed ?? null,
+            avgMinutes: stats?.avgMinutes ?? null,
+            avgPoints: stats?.avgPoints ?? null,
+            per: stats?.per ?? null,
+            bpmEstimate,
+            lostPoints,
+          };
+        })
+      );
+      players.sort((a, b) => b.lostPoints - a.lostPoints);
+      return { players, lostPoints: players.reduce((x, p) => x + p.lostPoints, 0) };
+    };
+
+    const [home, away] = await Promise.all([buildTeam(homeId), buildTeam(awayId)]);
+    res.json({ home, away, seasonYear });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ==========================================================================
+// ---- NBA: Backtesting real de Over/Under ----
+// ==========================================================================
+
+app.post("/api/nba/overunder/save", async (req, res) => {
+  const { game_date, home_code, away_code, line, over_prob, expected_total } = req.body || {};
+  if (!game_date || !home_code || !away_code || line == null || over_prob == null || expected_total == null) {
+    return res.status(400).json({ error: "Faltan datos requeridos" });
+  }
+  try {
+    const checkUrl = `${SUPABASE_URL}/rest/v1/nba_overunder_predictions?game_date=eq.${game_date}&home_code=eq.${home_code}&away_code=eq.${away_code}&select=id`;
+    const existing = await fetch(checkUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    if (Array.isArray(existing) && existing.length > 0) return res.json({ saved: false, reason: "ya existía" });
+    const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/nba_overunder_predictions`, {
+      method: "POST",
+      headers: { ...supabaseHeaders, Prefer: "return=representation" },
+      body: JSON.stringify([{ game_date, home_code, away_code, line, over_prob, expected_total }]),
+    });
+    if (!insertRes.ok) {
+      const bodyText = await insertRes.text().catch(() => "(sin cuerpo)");
+      console.error(`[nba/overunder/save] Supabase insert error ${insertRes.status}:`, bodyText);
+      throw new Error(`Supabase insert error ${insertRes.status}: ${bodyText}`);
+    }
+    res.json({ saved: true });
+  } catch (err) {
+    console.error("[nba/overunder/save] Error:", err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post("/api/nba/overunder/check", async (req, res) => {
+  try {
+    const today = todayET();
+    const pendingUrl = `${SUPABASE_URL}/rest/v1/nba_overunder_predictions?checked_at=is.null&game_date=lt.${today}&select=*`;
+    const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(pending)) {
+      console.error("[nba/overunder/check] Respuesta inesperada de Supabase (¿falta la tabla nba_overunder_predictions?):", JSON.stringify(pending).slice(0, 300));
+      return res.json({ checked: 0, updated: 0 });
+    }
+    const results = await Promise.all(
+      pending.map(async (pred) => {
+        const data = await cachedFetch(`nba-scoreboard-${pred.game_date}`, `${ESPN_NBA_SITE}/scoreboard?dates=${espnDateParam(pred.game_date)}`, 15 * 60 * 1000);
+        const match = (data.events || []).map(mapNbaEvent).find(
+          (g) => g.homeCode === pred.home_code && g.awayCode === pred.away_code && g.completed
+        );
+        if (!match || match.homeScore == null || match.awayScore == null) return false;
+        const total = match.homeScore + match.awayScore;
+        const result = total > pred.line ? "over" : total < pred.line ? "under" : "push";
+        await fetch(`${SUPABASE_URL}/rest/v1/nba_overunder_predictions?id=eq.${pred.id}`, {
+          method: "PATCH",
+          headers: supabaseHeaders,
+          body: JSON.stringify({ actual_total_points: total, actual_result: result, checked_at: new Date().toISOString() }),
+        });
+        return true;
+      })
+    );
+    res.json({ checked: pending.length, updated: results.filter(Boolean).length });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get("/api/nba/overunder/accuracy", async (req, res) => {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/nba_overunder_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
+    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(rows) || rows.length === 0) return res.json({ totalChecked: 0, accuracy: null, recent: [] });
+    const decisive = rows.filter((r) => r.actual_result !== "push");
+    let correct = 0;
+    for (const r of decisive) {
+      if ((r.over_prob >= 0.5 ? "over" : "under") === r.actual_result) correct++;
+    }
+    res.json({
+      totalChecked: decisive.length,
+      accuracy: decisive.length > 0 ? correct / decisive.length : null,
+      recent: rows.slice(0, 15).map((r) => ({
+        date: r.game_date, home: r.home_code, away: r.away_code,
+        line: r.line, overProb: r.over_prob, expectedTotal: r.expected_total,
+        actualTotalPoints: r.actual_total_points, actualResult: r.actual_result,
+      })),
+    });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
