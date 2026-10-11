@@ -3167,7 +3167,7 @@ app.post("/api/nhl/picks/check", async (req, res) => {
           const teamScore = isHome ? match.homeTeam.score : match.awayTeam.score;
           const oppScore = isHome ? match.awayTeam.score : match.homeTeam.score;
           success = teamScore > oppScore;
-        } else if (pick.pick_type === "goal" && pick.player_id) {
+        } else if (["goal", "assist", "point"].includes(pick.pick_type) && pick.player_id) {
           try {
             const box = await cachedFetch(`nhl-boxscore-${match.id}`, `${NHL_API}/gamecenter/${match.id}/boxscore`, 60 * 60 * 1000);
             const stats = box.playerByGameStats || {};
@@ -3176,7 +3176,13 @@ app.post("/api/nhl/picks/check", async (req, res) => {
               ...(stats.awayTeam?.forwards || []), ...(stats.awayTeam?.defense || []),
             ];
             const found = allSkaters.find((s) => String(s.playerId) === String(pick.player_id));
-            if (found) success = (found.goals || 0) > 0;
+            if (found) {
+              // gol = al menos 1 gol; asistencia = al menos 1 asistencia;
+              // punto = al menos 1 gol o asistencia (campo "points" del
+              // boxscore oficial de la NHL).
+              const field = pick.pick_type === "goal" ? "goals" : pick.pick_type === "assist" ? "assists" : "points";
+              success = (found[field] || 0) > 0;
+            }
           } catch { /* se revisa en otra ronda */ }
         }
 
@@ -3202,7 +3208,8 @@ app.get("/api/nhl/picks/accuracy", async (req, res) => {
     const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
     if (!Array.isArray(rows)) {
       console.error("[nhl/picks/accuracy] Respuesta inesperada de Supabase (¿falta la tabla nhl_daily_picks?):", JSON.stringify(rows).slice(0, 300));
-      return res.json({ teams: { accuracy: null, total: 0 }, goal: { accuracy: null, total: 0 }, recent: [] });
+      const empty = { accuracy: null, total: 0 };
+      return res.json({ teams: empty, goal: empty, assist: empty, point: empty, recent: [] });
     }
     const summarize = (type) => {
       const filtered = rows.filter((r) => r.pick_type === type);
@@ -3213,6 +3220,8 @@ app.get("/api/nhl/picks/accuracy", async (req, res) => {
     res.json({
       teams: summarize("team"),
       goal: summarize("goal"),
+      assist: summarize("assist"),
+      point: summarize("point"),
       recent: rows.slice(0, 20).map((r) => ({
         date: r.pick_date, type: r.pick_type, name: r.player_name, team: r.team_code,
         prob: r.predicted_prob, success: r.actual_success,
