@@ -831,6 +831,21 @@ app.get("/api/team/:code/bullpen", async (req, res) => {
   }
 });
 
+// Quita filas repetidas del mismo partido (misma fecha + local + visitante) antes
+// de calcular precisión: el guardado hace "revisar y luego insertar", y dos
+// aperturas simultáneas (lista + detalle) pueden meter el mismo juego dos
+// veces e inflar el conteo. Se queda con la primera fila de cada partido.
+function dedupeGames(rows) {
+  if (!Array.isArray(rows)) return rows;
+  const seen = new Set();
+  return rows.filter((r) => {
+    const k = `${r.game_date}|${r.home_code}|${r.away_code}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
 // ---- POST /api/predictions/save ----
 // Guarda la predicción real de un partido en la base de datos, para poder
 // compararla después contra el resultado real. Evita duplicados: si ya
@@ -915,7 +930,7 @@ app.get("/api/predictions/accuracy", async (req, res) => {
     const since = req.query.since;
     const sinceFilter = since ? `&game_date=gte.${since}` : "";
     const url = `${SUPABASE_URL}/rest/v1/predictions?checked_at=not.is.null${sinceFilter}&select=*&order=game_date.desc`;
-    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    const rows = dedupeGames(await fetch(url, { headers: supabaseHeaders }).then((r) => r.json()));
     if (!Array.isArray(rows) || rows.length === 0) {
       return res.json({ totalChecked: 0, accuracy: null, brierScore: null, recent: [], calibration: [] });
     }
@@ -1497,7 +1512,7 @@ app.get("/api/overunder/accuracy", async (req, res) => {
     const since = req.query.since;
     const sinceFilter = since ? `&game_date=gte.${since}` : "";
     const url = `${SUPABASE_URL}/rest/v1/overunder_predictions?checked_at=not.is.null${sinceFilter}&select=*&order=game_date.desc`;
-    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    const rows = dedupeGames(await fetch(url, { headers: supabaseHeaders }).then((r) => r.json()));
     if (!Array.isArray(rows) || rows.length === 0) {
       return res.json({ totalChecked: 0, accuracy: null, recent: [], calibration: [] });
     }
@@ -2090,7 +2105,7 @@ app.post("/api/nfl/overunder/check", async (req, res) => {
 app.get("/api/nfl/overunder/accuracy", async (req, res) => {
   try {
     const url = `${SUPABASE_URL}/rest/v1/nfl_overunder_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
-    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    const rows = dedupeGames(await fetch(url, { headers: supabaseHeaders }).then((r) => r.json()));
     if (!Array.isArray(rows) || rows.length === 0) {
       return res.json({ totalChecked: 0, accuracy: null, recent: [] });
     }
@@ -2430,8 +2445,10 @@ app.post("/api/nfl/predictions/check", async (req, res) => {
 
 app.get("/api/nfl/predictions/accuracy", async (req, res) => {
   try {
-    const url = `${SUPABASE_URL}/rest/v1/nfl_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
-    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    const since = req.query.since; // opcional ?since=YYYY-MM-DD para medir solo después de un cambio de modelo
+    const sinceFilter = since ? `&game_date=gte.${since}` : "";
+    const url = `${SUPABASE_URL}/rest/v1/nfl_predictions?checked_at=not.is.null${sinceFilter}&select=*&order=game_date.desc`;
+    const rows = dedupeGames(await fetch(url, { headers: supabaseHeaders }).then((r) => r.json()));
     if (!Array.isArray(rows) || rows.length === 0) {
       return res.json({ totalChecked: 0, accuracy: null, brierScore: null, recent: [] });
     }
