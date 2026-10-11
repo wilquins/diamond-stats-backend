@@ -2716,19 +2716,46 @@ app.get("/api/nhl/standings", async (req, res) => {
     // (≥400 juegos de local); si no (inicio de temporada: ruido enorme),
     // de la última temporada regular completa — mismos datos oficiales,
     // tomados al final de la temporada anterior.
+    // Temporada anterior COMPLETA (mismo endpoint oficial, tomado en la fecha
+    // en que terminó la temporada regular según /standings-season). Sirve
+    // para (1) los splits de liga cuando la actual tiene poca muestra y
+    // (2) el "prior" de cada equipo, que el frontend mezcla con la
+    // temporada actual cuando hay pocos juegos.
+    const seasonStart = Number(String(teams[0]?.seasonId || "").slice(0, 4));
+    let prevStandings = null;
+    let priorSeasonId = null;
+    if (seasonStart) {
+      try {
+        priorSeasonId = `${seasonStart - 1}${seasonStart}`;
+        let endDate = `${seasonStart}-04-10`; // respaldo si no se encuentra la fecha real
+        try {
+          const seasons = await cachedFetch("nhl-standings-seasons", `${NHL_API}/standings-season`, 24 * 60 * 60 * 1000);
+          const found = (seasons.seasons || []).find((x) => String(x.id) === priorSeasonId);
+          if (found?.standingsEnd) endDate = found.standingsEnd;
+        } catch { /* usa la fecha de respaldo */ }
+        const prev = await cachedFetch(`nhl-standings-prev-${endDate}`, `${NHL_API}/standings/${endDate}`, 24 * 60 * 60 * 1000);
+        if ((prev.standings || []).length > 0) prevStandings = prev.standings;
+      } catch { /* sin prior: el frontend usa solo la temporada actual */ }
+    }
+    if (prevStandings) {
+      const priorByCode = {};
+      for (const t of prevStandings) {
+        const c = t.teamAbbrev?.default;
+        if (c) priorByCode[c] = { pointPctg: t.pointPctg, gamesPlayed: t.gamesPlayed, goalFor: t.goalFor, goalAgainst: t.goalAgainst };
+      }
+      for (const t of teams) t.prior = priorByCode[t.code] || null;
+    }
+
+    // Splits de liga: de la temporada actual si ya hay muestra suficiente
+    // (≥400 juegos de local); si no (inicio de temporada: ruido enorme),
+    // de la última temporada regular completa.
     let league = computeNhlLeagueSplits(data.standings || []);
     let leagueSource = "temporada actual";
-    if (!league || league.homeGames < 400) {
-      const seasonStart = Number(String(teams[0]?.seasonId || "").slice(0, 4));
-      if (seasonStart) {
-        try {
-          const prev = await cachedFetch("nhl-standings-prev", `${NHL_API}/standings/${seasonStart}-04-10`, 24 * 60 * 60 * 1000);
-          const prevLeague = computeNhlLeagueSplits(prev.standings || []);
-          if (prevLeague && prevLeague.homeGames >= 400) { league = prevLeague; leagueSource = "temporada anterior completa"; }
-        } catch { /* se queda con lo que haya */ }
-      }
+    if ((!league || league.homeGames < 400) && prevStandings) {
+      const prevLeague = computeNhlLeagueSplits(prevStandings);
+      if (prevLeague && prevLeague.homeGames >= 400) { league = prevLeague; leagueSource = "temporada anterior completa"; }
     }
-    res.json({ teams, seasonId: teams[0]?.seasonId ?? null, league, leagueSource });
+    res.json({ teams, seasonId: teams[0]?.seasonId ?? null, priorSeasonId, league, leagueSource });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
