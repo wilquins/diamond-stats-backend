@@ -3067,6 +3067,10 @@ app.get("/api/nhl/team/:code/skater-stats", async (req, res) => {
       // Probabilidad real de al menos 1 gol vía Poisson — mismo
       // principio que ya usamos para TD (NFL) y jonrones (MLB).
       const goalProbability = 1 - Math.exp(-goalsPerGame);
+      // Asistencias y puntos (goles + asistencias): mismo principio —
+      // Poisson sobre su tasa real por juego esta temporada.
+      const assistsPerGame = (s.assists || 0) / s.gamesPlayed;
+      const pointsPerGame = (s.points || 0) / s.gamesPlayed;
       return {
         id: s.playerId,
         name: `${s.firstName?.default || ""} ${s.lastName?.default || ""}`.trim(),
@@ -3075,6 +3079,10 @@ app.get("/api/nhl/team/:code/skater-stats", async (req, res) => {
         goals: s.goals,
         goalsPerGame,
         goalProbability,
+        assists: s.assists || 0,
+        assistProbability: 1 - Math.exp(-assistsPerGame),
+        points: s.points || 0,
+        pointProbability: 1 - Math.exp(-pointsPerGame),
       };
     });
 
