@@ -1352,15 +1352,20 @@ app.post("/api/picks/check", async (req, res) => {
 // "este equipo va a ganar", ¿qué tan seguido pasó de verdad?
 app.get("/api/picks/accuracy", async (req, res) => {
   try {
-    const url = `${SUPABASE_URL}/rest/v1/daily_picks?checked_at=not.is.null&select=*&order=pick_date.desc`;
+    const since = req.query.since; // opcional ?since=YYYY-MM-DD: mide solo después de un cambio de modelo
+    const sinceFilter = since ? `&game_date=gte.${since}`.replace("game_date", "pick_date") : "";
+    const url = `${SUPABASE_URL}/rest/v1/daily_picks?checked_at=not.is.null${sinceFilter}&select=*&order=pick_date.desc`;
     const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
     if (!Array.isArray(rows)) throw new Error("Respuesta inesperada de Supabase");
 
     const summarize = (type) => {
       const filtered = rows.filter((r) => r.pick_type === type);
-      if (filtered.length === 0) return { total: 0, accuracy: null };
+      if (filtered.length === 0) return { total: 0, accuracy: null, avgPredicted: null };
       const successes = filtered.filter((r) => r.actual_success === true).length;
-      return { total: filtered.length, accuracy: successes / filtered.length };
+      // avgPredicted: probabilidad promedio que dio el modelo — si es mucho
+      // mayor que la precisión real, el modelo está sobreconfiado.
+      const avgPredicted = filtered.reduce((x, r) => x + (r.predicted_prob || 0), 0) / filtered.length;
+      return { total: filtered.length, accuracy: successes / filtered.length, avgPredicted };
     };
 
     res.json({
@@ -2104,7 +2109,9 @@ app.post("/api/nfl/overunder/check", async (req, res) => {
 // ---- GET /api/nfl/overunder/accuracy ----
 app.get("/api/nfl/overunder/accuracy", async (req, res) => {
   try {
-    const url = `${SUPABASE_URL}/rest/v1/nfl_overunder_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
+    const since = req.query.since; // opcional ?since=YYYY-MM-DD
+    const sinceFilter = since ? `&game_date=gte.${since}` : "";
+    const url = `${SUPABASE_URL}/rest/v1/nfl_overunder_predictions?checked_at=not.is.null${sinceFilter}&select=*&order=game_date.desc`;
     const rows = dedupeGames(await fetch(url, { headers: supabaseHeaders }).then((r) => r.json()));
     if (!Array.isArray(rows) || rows.length === 0) {
       return res.json({ totalChecked: 0, accuracy: null, recent: [] });
@@ -2595,7 +2602,9 @@ app.post("/api/nfl/picks/check", async (req, res) => {
 
 app.get("/api/nfl/picks/accuracy", async (req, res) => {
   try {
-    const url = `${SUPABASE_URL}/rest/v1/nfl_daily_picks?checked_at=not.is.null&select=*&order=pick_date.desc`;
+    const since = req.query.since; // opcional ?since=YYYY-MM-DD
+    const sinceFilter = since ? `&pick_date=gte.${since}` : "";
+    const url = `${SUPABASE_URL}/rest/v1/nfl_daily_picks?checked_at=not.is.null${sinceFilter}&select=*&order=pick_date.desc`;
     const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
     const summarize = (type) => {
       const filtered = rows.filter((r) => r.pick_type === type);
@@ -3291,7 +3300,9 @@ app.post("/api/nhl/picks/check", async (req, res) => {
 
 app.get("/api/nhl/picks/accuracy", async (req, res) => {
   try {
-    const url = `${SUPABASE_URL}/rest/v1/nhl_daily_picks?checked_at=not.is.null&select=*&order=pick_date.desc`;
+    const since = req.query.since; // opcional ?since=YYYY-MM-DD
+    const sinceFilter = since ? `&pick_date=gte.${since}` : "";
+    const url = `${SUPABASE_URL}/rest/v1/nhl_daily_picks?checked_at=not.is.null${sinceFilter}&select=*&order=pick_date.desc`;
     const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
     if (!Array.isArray(rows)) {
       console.error("[nhl/picks/accuracy] Respuesta inesperada de Supabase (¿falta la tabla nhl_daily_picks?):", JSON.stringify(rows).slice(0, 300));
@@ -4135,7 +4146,7 @@ app.post("/api/nba/picks/check", async (req, res) => {
 
 app.get("/api/nba/picks/accuracy", async (req, res) => {
   try {
-    const rows = await fetch(`${SUPABASE_URL}/rest/v1/nba_daily_picks?checked_at=not.is.null&select=*&order=pick_date.desc`, { headers: supabaseHeaders }).then((r) => r.json());
+    const rows = await fetch(`${SUPABASE_URL}/rest/v1/nba_daily_picks?checked_at=not.is.null${req.query.since ? `&pick_date=gte.${req.query.since}` : ""}&select=*&order=pick_date.desc`, { headers: supabaseHeaders }).then((r) => r.json());
     if (!Array.isArray(rows)) {
       const empty = { accuracy: null, total: 0 };
       return res.json({ teams: empty, dd: empty, td: empty, pts: empty, reb: empty, ast: empty, recent: [] });
@@ -4151,6 +4162,76 @@ app.get("/api/nba/picks/accuracy", async (req, res) => {
       voided: rows.length - counted.length,
       recent: counted.slice(0, 20).map((r) => ({ date: r.pick_date, type: r.pick_type, name: r.player_name, team: r.team_code, prob: r.predicted_prob, threshold: r.threshold ?? null, success: r.actual_success })),
     });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ==========================================================================
+// ---- Ventaja de casa MEDIDA de la liga (MLB y NFL) ----
+// Antes se usaban constantes fijas (MLB 0.024, NFL 0.032). Ahora se mide de
+// los récords oficiales de casa de todos los equipos, igual que en NHL/NBA:
+// % de victorias de local = victorias de local ÷ juegos de local de la liga.
+// ==========================================================================
+
+// MLB: standings oficiales de la MLB, splitRecords tipo "home" (verificado en
+// vivo: 30 equipos, 2026 completo = 1,284 victorias y 1,145 derrotas de local).
+app.get("/api/mlb/league-home", async (req, res) => {
+  try {
+    const sumYear = async (year) => {
+      const data = await cachedFetch(`mlb-league-home-${year}`, `${MLB_API}/standings?leagueId=103,104&season=${year}`, 6 * 60 * 60 * 1000);
+      let w = 0, l = 0;
+      for (const rec of data.records || []) {
+        for (const t of rec.teamRecords || []) {
+          const home = (t.records?.splitRecords || []).find((x) => x.type === "home");
+          if (home) { w += home.wins || 0; l += home.losses || 0; }
+        }
+      }
+      return { w, l };
+    };
+    const year = Number(todayET().slice(0, 4));
+    let { w, l } = await sumYear(year);
+    let source = "temporada actual";
+    if (w + l < 1000) { // inicio de temporada: muestra muy chica
+      const prev = await sumYear(year - 1);
+      if (prev.w + prev.l >= 1000) { w = prev.w; l = prev.l; source = "temporada anterior completa"; }
+    }
+    res.json({ homeWinPct: w + l > 0 ? w / (w + l) : null, games: w + l, source });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// NFL: ESPN standings, stat tipo "home" con summary "W-L" o "W-L-T" (verificado
+// en vivo con la temporada 2025). Se suman las últimas 3 temporadas (la actual,
+// aunque vaya incompleta, y las 2 anteriores) para tener muestra suficiente
+// (una sola temporada son solo 272 juegos, ruido de ±3%). Los empates cuentan
+// medio triunfo.
+app.get("/api/nfl/league-home", async (req, res) => {
+  try {
+    const today = todayET();
+    const y = Number(today.slice(0, 4));
+    const m = Number(today.slice(5, 7));
+    const seasonNow = m >= 8 ? y : y - 1;
+    let w = 0, games = 0, used = [];
+    for (const season of [seasonNow, seasonNow - 1, seasonNow - 2]) {
+      try {
+        const data = await cachedFetch(`nfl-league-home-${season}`, `https://site.api.espn.com/apis/v2/sports/football/nfl/standings?season=${season}`, 6 * 60 * 60 * 1000);
+        let sw = 0, sg = 0;
+        for (const conf of data.children || []) {
+          for (const entry of conf.standings?.entries || []) {
+            const home = (entry.stats || []).find((s) => s.type === "home");
+            const m2 = /^(\d+)-(\d+)(?:-(\d+))?/.exec(home?.summary || home?.displayValue || "");
+            if (!m2) continue;
+            const hw = Number(m2[1]), hl = Number(m2[2]), ht = Number(m2[3] || 0);
+            sw += hw + ht * 0.5;
+            sg += hw + hl + ht;
+          }
+        }
+        if (sg > 0) { w += sw; games += sg; used.push(season); }
+      } catch { /* se salta esa temporada */ }
+    }
+    res.json({ homeWinPct: games > 0 ? w / games : null, games, seasons: used });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
