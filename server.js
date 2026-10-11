@@ -3668,8 +3668,8 @@ app.get("/api/nba/backtest-status", async (req, res) => {
         return { exists: false, total: 0, pending: 0 };
       }
     };
-    const [predictions, overunder] = await Promise.all([summarize("nba_predictions"), summarize("nba_overunder_predictions")]);
-    res.json({ predictions, overunder });
+    const [predictions, overunder, picks] = await Promise.all([summarize("nba_predictions"), summarize("nba_overunder_predictions"), summarize("nba_daily_picks")]);
+    res.json({ predictions, overunder, picks });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -3860,6 +3860,239 @@ app.get("/api/nba/overunder/accuracy", async (req, res) => {
         line: r.line, overProb: r.over_prob, expectedTotal: r.expected_total,
         actualTotalPoints: r.actual_total_points, actualResult: r.actual_result,
       })),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ==========================================================================
+// ---- NBA — Fase 3: Picks del día de jugadores ----
+// SOLO con datos verificados en vivo en ESPN:
+//  - Plantilla: teams/{id}/roster (id, nombre, posición).
+//  - Promedios de temporada (core API): juegos, minutos, puntos, rebotes,
+//    asistencias, dobles-dobles y triples-dobles REALES de la temporada.
+//  - Resultado real: boxscore del juego (summary?event=) con puntos,
+//    rebotes, asistencias, robos y tapones por jugador.
+// La probabilidad de doble-doble / triple-doble es la FRECUENCIA REAL de la
+// temporada (dobles-dobles ÷ juegos jugados). No se ajusta por rival,
+// minutos de hoy ni ritmo: esa limitación se muestra en pantalla. Los picks
+// de "X+ puntos/rebotes/asistencias" necesitan la distribución juego por
+// juego y el registro por juego de ESPN no se pudo verificar completo, así
+// que NO se inventa una desviación estándar: queda para la Fase 3b.
+// ==========================================================================
+
+async function getNbaPlayerFull(athleteId, seasonYear) {
+  const one = async (year) => {
+    try {
+      const data = await cachedFetch(
+        `nba-player-full-${athleteId}-${year}`,
+        `https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba/seasons/${year}/types/2/athletes/${athleteId}/statistics/0`,
+        6 * 60 * 60 * 1000
+      );
+      const stat = (cat, name) => data.splits?.categories?.find((c) => c.name === cat)?.stats?.find((x) => x.name === name)?.value ?? null;
+      return {
+        season: year,
+        gamesPlayed: stat("general", "gamesPlayed"),
+        avgMinutes: stat("general", "avgMinutes"),
+        avgPoints: stat("offensive", "avgPoints"),
+        avgRebounds: stat("general", "avgRebounds"),
+        avgAssists: stat("offensive", "avgAssists"),
+        doubleDouble: stat("general", "doubleDouble"),
+        tripleDouble: stat("general", "tripleDouble"),
+      };
+    } catch {
+      return null;
+    }
+  };
+  const cur = await one(seasonYear);
+  if (cur && (cur.gamesPlayed || 0) >= NBA_MIN_GAMES_FOR_PLAYER_STATS) return cur;
+  // Pocos juegos esta temporada (inicio de campaña): se usa la anterior si tiene muestra.
+  const prev = await one(seasonYear - 1);
+  if (prev && (prev.gamesPlayed || 0) >= NBA_MIN_GAMES_FOR_PLAYER_STATS) return prev;
+  return cur || prev;
+}
+
+// ---- GET /api/nba/team/:id/players ----
+app.get("/api/nba/team/:id/players", async (req, res) => {
+  const teamId = req.params.id;
+  try {
+    const standings = await cachedFetch("nba-standings", `${ESPN_NBA_V2}/standings`, 60 * 60 * 1000);
+    const seasonYear = standings.children?.[0]?.standings?.season;
+    if (!seasonYear) return res.status(502).json({ error: "No se pudo determinar la temporada de referencia" });
+
+    const roster = await cachedFetch(`nba-roster-${teamId}`, `${ESPN_NBA_SITE}/teams/${teamId}/roster`, 6 * 60 * 60 * 1000);
+    const flat = [];
+    for (const a of roster.athletes || []) {
+      if (Array.isArray(a.items)) flat.push(...a.items);
+      else flat.push(a);
+    }
+
+    // Lesionados reales (ESPN): "Out" se excluye de los picks; "Day-To-Day" se marca.
+    const inj = await cachedFetch("nba-injuries", `${ESPN_NBA_SITE}/injuries`, 10 * 60 * 1000);
+    const group = (inj.injuries || []).find((g) => String(g.id) === String(teamId));
+    const statusById = {};
+    for (const e of group?.injuries || []) {
+      const id = extractAthleteId(e.athlete);
+      if (id) statusById[id] = e.status || e.type?.description || null;
+    }
+
+    const players = (
+      await Promise.all(
+        flat.map(async (a) => {
+          const id = extractAthleteId(a);
+          if (!id) return null;
+          const st = await getNbaPlayerFull(id, seasonYear);
+          const gp = st?.gamesPlayed || 0;
+          const reliable = gp >= NBA_MIN_GAMES_FOR_PLAYER_STATS;
+          return {
+            id,
+            name: a.displayName || a.fullName || null,
+            position: a.position?.abbreviation || null,
+            status: statusById[id] || null,
+            season: st?.season ?? null,
+            gamesPlayed: gp,
+            hasStats: reliable,
+            avgMinutes: st?.avgMinutes ?? null,
+            avgPoints: st?.avgPoints ?? null,
+            avgRebounds: st?.avgRebounds ?? null,
+            avgAssists: st?.avgAssists ?? null,
+            doubleDoubleProb: reliable && st.doubleDouble != null ? st.doubleDouble / gp : null,
+            tripleDoubleProb: reliable && st.tripleDouble != null ? st.tripleDouble / gp : null,
+          };
+        })
+      )
+    ).filter(Boolean);
+
+    res.json({ teamId, seasonYear, players });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- Diagnóstico para la Fase 3b: forma real del registro por juego ----
+app.get("/api/nba/debug/gamelog/:id", async (req, res) => {
+  try {
+    const year = req.query.season || "";
+    const url = `https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/${req.params.id}/gamelog${year ? `?season=${year}` : ""}`;
+    const d = await fetch(url).then((r) => r.json());
+    const firstCat = d.seasonTypes?.[0]?.categories?.[0];
+    res.json({
+      topKeys: Object.keys(d),
+      labels: d.labels,
+      seasonTypes: (d.seasonTypes || []).map((s) => ({ name: s.displayName, categories: (s.categories || []).length })),
+      firstCategoryKeys: firstCat ? Object.keys(firstCat) : null,
+      firstEventSample: firstCat?.events?.[0] || null,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- Backtesting de picks de jugadores NBA ----
+app.post("/api/nba/picks/save", async (req, res) => {
+  const picks = req.body?.picks;
+  if (!Array.isArray(picks) || picks.length === 0) {
+    return res.status(400).json({ error: "Se esperaba un arreglo 'picks'" });
+  }
+  try {
+    const dateTypeKeys = new Set(picks.map((p) => `${p.pick_date}|${p.pick_type}`));
+    for (const key of dateTypeKeys) {
+      const [pick_date, pick_type] = key.split("|");
+      await fetch(
+        `${SUPABASE_URL}/rest/v1/nba_daily_picks?pick_date=eq.${pick_date}&pick_type=eq.${pick_type}&checked_at=is.null`,
+        { method: "DELETE", headers: supabaseHeaders }
+      ).catch(() => {});
+    }
+    let saved = 0;
+    for (const p of picks) {
+      const { pick_date, pick_type, player_id, player_name, team_code, predicted_prob } = p;
+      if (!pick_date || !["team", "dd", "td"].includes(pick_type) || !team_code || predicted_prob == null) continue;
+      const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/nba_daily_picks`, {
+        method: "POST",
+        headers: { ...supabaseHeaders, Prefer: "return=representation" },
+        body: JSON.stringify([{ pick_date, pick_type, player_id: player_id || null, player_name: player_name || team_code, team_code, predicted_prob }]),
+      });
+      if (insertRes.ok) saved++;
+      else console.error(`[nba/picks/save] Supabase insert error ${insertRes.status}:`, await insertRes.text().catch(() => "(sin cuerpo)"));
+    }
+    res.json({ saved });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post("/api/nba/picks/check", async (req, res) => {
+  try {
+    const pendingRaw = await fetch(`${SUPABASE_URL}/rest/v1/nba_daily_picks?checked_at=is.null&pick_date=lt.${todayET()}&select=*`, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(pendingRaw)) {
+      console.error("[nba/picks/check] Respuesta inesperada de Supabase (¿falta la tabla nba_daily_picks?):", JSON.stringify(pendingRaw).slice(0, 300));
+      return res.json({ checked: 0, updated: 0 });
+    }
+    const results = await Promise.all(
+      pendingRaw.map(async (pick) => {
+        try {
+          const day = await cachedFetch(`nba-scoreboard-${pick.pick_date}`, `${ESPN_NBA_SITE}/scoreboard?dates=${espnDateParam(pick.pick_date)}`, 15 * 60 * 1000);
+          const match = (day.events || []).map(mapNbaEvent).find((g) => g.completed && (g.homeCode === pick.team_code || g.awayCode === pick.team_code));
+          if (!match) return false;
+
+          let success = null;
+          let voided = false;
+          if (pick.pick_type === "team") {
+            const isHome = match.homeCode === pick.team_code;
+            success = isHome ? match.homeWinner : match.awayWinner;
+          } else if ((pick.pick_type === "dd" || pick.pick_type === "td") && pick.player_id) {
+            const sum = await cachedFetch(`nba-summary-${match.id}`, `${ESPN_NBA_SITE}/summary?event=${match.id}`, 24 * 60 * 60 * 1000);
+            let entry = null, keys = null;
+            for (const t of sum.boxscore?.players || []) {
+              const block = t.statistics?.[0];
+              const found = (block?.athletes || []).find((x) => String(x.athlete?.id) === String(pick.player_id));
+              if (found) { entry = found; keys = block.keys; break; }
+            }
+            if (!entry || !keys) return false; // sin boxscore todavía: se revisa en otra ronda
+            if (entry.didNotPlay || !entry.stats || entry.stats.length === 0) {
+              voided = true; // no jugó: no cuenta ni a favor ni en contra
+            } else {
+              const val = (k) => { const i = keys.indexOf(k); const n = i >= 0 ? Number(entry.stats[i]) : 0; return Number.isFinite(n) ? n : 0; };
+              const cats = ["points", "rebounds", "assists", "steals", "blocks"].filter((k) => val(k) >= 10).length;
+              success = pick.pick_type === "dd" ? cats >= 2 : cats >= 3;
+            }
+          }
+          if (success == null && !voided) return false;
+          await fetch(`${SUPABASE_URL}/rest/v1/nba_daily_picks?id=eq.${pick.id}`, {
+            method: "PATCH",
+            headers: supabaseHeaders,
+            body: JSON.stringify({ actual_success: voided ? null : success, checked_at: new Date().toISOString() }),
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      })
+    );
+    res.json({ checked: pendingRaw.length, updated: results.filter(Boolean).length });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get("/api/nba/picks/accuracy", async (req, res) => {
+  try {
+    const rows = await fetch(`${SUPABASE_URL}/rest/v1/nba_daily_picks?checked_at=not.is.null&select=*&order=pick_date.desc`, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(rows)) {
+      const empty = { accuracy: null, total: 0 };
+      return res.json({ teams: empty, dd: empty, td: empty, recent: [] });
+    }
+    const counted = rows.filter((r) => r.actual_success !== null && r.actual_success !== undefined); // sin los que no jugaron
+    const summarize = (type) => {
+      const f = counted.filter((r) => r.pick_type === type);
+      if (f.length === 0) return { accuracy: null, total: 0 };
+      return { accuracy: f.filter((r) => r.actual_success === true).length / f.length, total: f.length };
+    };
+    res.json({
+      teams: summarize("team"), dd: summarize("dd"), td: summarize("td"),
+      voided: rows.length - counted.length,
+      recent: counted.slice(0, 20).map((r) => ({ date: r.pick_date, type: r.pick_type, name: r.player_name, team: r.team_code, prob: r.predicted_prob, success: r.actual_success })),
     });
   } catch (err) {
     res.status(502).json({ error: err.message });
