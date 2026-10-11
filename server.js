@@ -2653,6 +2653,28 @@ app.get("/api/nhl/games", async (req, res) => {
 // a mano, a diferencia de MLB/NFL). Si la temporada regular 2026-27 aún no
 // arrancó, esto devuelve la última temporada regular completa como
 // referencia real — no inventa ceros ni una tabla vacía.
+// Promedios REALES de la liga para casa/ruta, medidos de los récords de
+// todos los equipos: % de victorias de local, y % de puntos de local, de
+// visitante y total (para descontar la ventaja de casa de la liga del
+// ajuste casa/ruta de cada equipo — si no, se cuenta dos veces).
+function computeNhlLeagueSplits(rawTeams) {
+  let hw = 0, hl = 0, ho = 0, rw = 0, rl = 0, ro = 0;
+  for (const t of rawTeams) {
+    hw += t.homeWins || 0; hl += t.homeLosses || 0; ho += t.homeOtLosses || 0;
+    rw += t.roadWins || 0; rl += t.roadLosses || 0; ro += t.roadOtLosses || 0;
+  }
+  const homeGames = hw + hl + ho, roadGames = rw + rl + ro;
+  if (homeGames === 0 || roadGames === 0) return null;
+  const homePtsPct = (hw + 0.5 * ho) / homeGames;
+  const roadPtsPct = (rw + 0.5 * ro) / roadGames;
+  return {
+    homeGames,
+    homeWinRate: hw / homeGames, // victorias de local / juegos de local
+    homePtsPct, roadPtsPct,
+    overallPtsPct: (hw + 0.5 * ho + rw + 0.5 * ro) / (homeGames + roadGames),
+  };
+}
+
 app.get("/api/nhl/standings", async (req, res) => {
   try {
     const data = await cachedFetch("nhl-standings", `${NHL_API}/standings/now`, 60 * 60 * 1000);
@@ -2672,7 +2694,24 @@ app.get("/api/nhl/standings", async (req, res) => {
       seasonId: t.seasonId,
     }));
     teams.sort((a, b) => (b.pointPctg ?? 0) - (a.pointPctg ?? 0));
-    res.json({ teams, seasonId: teams[0]?.seasonId ?? null });
+
+    // Splits de liga: de la temporada actual si ya hay muestra suficiente
+    // (≥400 juegos de local); si no (inicio de temporada: ruido enorme),
+    // de la última temporada regular completa — mismos datos oficiales,
+    // tomados al final de la temporada anterior.
+    let league = computeNhlLeagueSplits(data.standings || []);
+    let leagueSource = "temporada actual";
+    if (!league || league.homeGames < 400) {
+      const seasonStart = Number(String(teams[0]?.seasonId || "").slice(0, 4));
+      if (seasonStart) {
+        try {
+          const prev = await cachedFetch("nhl-standings-prev", `${NHL_API}/standings/${seasonStart}-04-10`, 24 * 60 * 60 * 1000);
+          const prevLeague = computeNhlLeagueSplits(prev.standings || []);
+          if (prevLeague && prevLeague.homeGames >= 400) { league = prevLeague; leagueSource = "temporada anterior completa"; }
+        } catch { /* se queda con lo que haya */ }
+      }
+    }
+    res.json({ teams, seasonId: teams[0]?.seasonId ?? null, league, leagueSource });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -3362,12 +3401,39 @@ app.get("/api/nba/standings", async (req, res) => {
       }
     }
     teams.sort((a, b) => (b.winPct ?? 0) - (a.winPct ?? 0));
-    let hw = 0, hl = 0;
-    for (const t of teams) { hw += t.homeWins || 0; hl += t.homeLosses || 0; }
+    const homeShare = (list) => {
+      let hw = 0, hl = 0;
+      for (const t of list) { hw += t.homeWins || 0; hl += t.homeLosses || 0; }
+      return { games: hw + hl, pct: hw + hl > 0 ? hw / (hw + hl) : null };
+    };
+    // Ventaja de casa de la liga MEDIDA: de la temporada de estas
+    // posiciones si ya hay muestra suficiente (≥400 juegos de local); si
+    // no (inicio de temporada: ruido enorme), de la temporada anterior
+    // completa (misma API de ESPN con ?season=año-1).
+    let { games, pct } = homeShare(teams);
+    let leagueHomeSource = seasonDisplayName;
+    if (games < 400 && seasonYear) {
+      try {
+        const prev = await cachedFetch(`nba-standings-${seasonYear - 1}`, `${ESPN_NBA_V2}/standings?season=${seasonYear - 1}`, 24 * 60 * 60 * 1000);
+        const prevTeams = [];
+        let prevName = null;
+        for (const conf of prev.children || []) {
+          prevName = prevName ?? conf.standings?.seasonDisplayName ?? null;
+          for (const entry of conf.standings?.entries || []) {
+            const hs = entry.stats?.find((x) => x.name === "Home");
+            const rec = parseNbaRecord(hs?.summary || hs?.displayValue);
+            if (rec) prevTeams.push({ homeWins: rec.w, homeLosses: rec.l });
+          }
+        }
+        const p = homeShare(prevTeams);
+        if (p.games >= 400) { pct = p.pct; games = p.games; leagueHomeSource = prevName; }
+      } catch { /* se queda con lo que haya */ }
+    }
     res.json({
       teams,
       seasonYear, seasonDisplayName,
-      leagueHomeWinPct: hw + hl > 0 ? hw / (hw + hl) : null,
+      leagueHomeWinPct: games >= 400 ? pct : null,
+      leagueHomeSource,
     });
   } catch (err) {
     res.status(502).json({ error: err.message });
