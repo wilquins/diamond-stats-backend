@@ -3259,3 +3259,282 @@ app.get("/api/nhl/backtest-status", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ==========================================================================
+// ---- NBA — Fase 1 (juegos reales, tabla de posiciones, probabilidad de
+// ganar, fuerza de calendario, descanso/back-to-back, backtesting). Fuente:
+// la API pública de ESPN para NBA (verificada en vivo): scoreboard con
+// récords y marcadores, standings con puntos a favor/en contra y récord
+// casa/ruta/últimos 10, y calendario por equipo. Mismo principio que ya
+// usamos en MLB/NFL/NHL: cada número viene de una fuente real, nunca
+// inventado. Pendiente (Fase 2): lesiones/alineación real (el factor más
+// grande en NBA, el equivalente al portero en NHL) + Over/Under + Picks
+// de jugadores.
+// ==========================================================================
+
+const ESPN_NBA_SITE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba";
+const ESPN_NBA_V2 = "https://site.api.espn.com/apis/v2/sports/basketball/nba";
+
+// "31-9" -> { w: 31, l: 9 }
+function parseNbaRecord(summary) {
+  const m = /^(\d+)-(\d+)/.exec(summary || "");
+  return m ? { w: Number(m[1]), l: Number(m[2]) } : null;
+}
+
+// Fecha YYYY-MM-DD -> YYYYMMDD (formato del parámetro dates de ESPN)
+function espnDateParam(date) {
+  return date.replace(/-/g, "");
+}
+
+function shiftDate(date, days) {
+  const d = new Date(`${date}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function mapNbaEvent(e) {
+  const comp = e.competitions?.[0];
+  const home = comp?.competitors?.find((c) => c.homeAway === "home");
+  const away = comp?.competitors?.find((c) => c.homeAway === "away");
+  const seasonType = e.season?.type ?? null; // 1 = pretemporada, 2 = regular, 3 = playoffs
+  const statusName = comp?.status?.type?.name || e.status?.type?.name || null;
+  const num = (v) => (v === undefined || v === null || v === "" ? null : Number(v));
+  return {
+    id: e.id,
+    startTime: e.date,
+    seasonType,
+    isPreseason: seasonType === 1,
+    status: statusName, // STATUS_SCHEDULED | STATUS_IN_PROGRESS | STATUS_FINAL ...
+    completed: !!comp?.status?.type?.completed,
+    venue: comp?.venue?.fullName || null,
+    awayCode: away?.team?.abbreviation, awayName: away?.team?.shortDisplayName || away?.team?.name || away?.team?.displayName,
+    awayFullName: away?.team?.displayName || null, awayId: away?.team?.id, awayScore: num(away?.score),
+    homeCode: home?.team?.abbreviation, homeName: home?.team?.shortDisplayName || home?.team?.name || home?.team?.displayName,
+    homeFullName: home?.team?.displayName || null, homeId: home?.team?.id, homeScore: num(home?.score),
+    awayWinner: away?.winner === true, homeWinner: home?.winner === true,
+  };
+}
+
+// ---- GET /api/nba/games?date=YYYY-MM-DD ----
+app.get("/api/nba/games", async (req, res) => {
+  try {
+    const date = req.query.date || todayET();
+    const data = await cachedFetch(`nba-scoreboard-${date}`, `${ESPN_NBA_SITE}/scoreboard?dates=${espnDateParam(date)}`, 5 * 60 * 1000);
+    const games = (data.events || []).map(mapNbaEvent);
+    res.json({ date, games });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nba/standings ----
+// Posiciones reales. Incluye puntos a favor/en contra por juego (base de
+// la Expectativa Pitagórica), récord casa/ruta, últimos 10 y racha.
+// leagueHomeWinPct se MIDE de los récords casa/ruta reales de los 30
+// equipos de la misma temporada (no un número citado de memoria).
+app.get("/api/nba/standings", async (req, res) => {
+  try {
+    const data = await cachedFetch("nba-standings", `${ESPN_NBA_V2}/standings`, 60 * 60 * 1000);
+    const teams = [];
+    let seasonYear = null, seasonDisplayName = null;
+    for (const conf of data.children || []) {
+      seasonYear = seasonYear ?? conf.standings?.season ?? null;
+      seasonDisplayName = seasonDisplayName ?? conf.standings?.seasonDisplayName ?? null;
+      for (const entry of conf.standings?.entries || []) {
+        const stat = (name) => entry.stats?.find((s) => s.name === name);
+        const val = (name) => stat(name)?.value ?? null;
+        const rec = (name) => parseNbaRecord(stat(name)?.summary || stat(name)?.displayValue);
+        const home = rec("Home"), road = rec("Road"), l10 = rec("Last Ten Games");
+        teams.push({
+          id: entry.team?.id,
+          code: entry.team?.abbreviation,
+          name: entry.team?.shortDisplayName || entry.team?.name,
+          fullName: entry.team?.displayName || null,
+          conference: conf.name || conf.abbreviation || null,
+          wins: val("wins"), losses: val("losses"), winPct: val("winPercent"),
+          avgPointsFor: val("avgPointsFor"), avgPointsAgainst: val("avgPointsAgainst"),
+          differential: val("differential"),
+          homeWins: home?.w ?? null, homeLosses: home?.l ?? null,
+          roadWins: road?.w ?? null, roadLosses: road?.l ?? null,
+          l10Wins: l10?.w ?? null, l10Losses: l10?.l ?? null,
+          streak: stat("streak")?.displayValue ?? null,
+        });
+      }
+    }
+    teams.sort((a, b) => (b.winPct ?? 0) - (a.winPct ?? 0));
+    let hw = 0, hl = 0;
+    for (const t of teams) { hw += t.homeWins || 0; hl += t.homeLosses || 0; }
+    res.json({
+      teams,
+      seasonYear, seasonDisplayName,
+      leagueHomeWinPct: hw + hl > 0 ? hw / (hw + hl) : null,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nba/team/:id/schedule-analysis ----
+// Fuerza real de calendario: promedio del % de victorias de los rivales ya
+// enfrentados en la temporada de referencia (la misma que reporta
+// /standings — si la 2026-27 aún no tiene juegos de temporada regular,
+// cae honestamente en la última completa).
+app.get("/api/nba/team/:id/schedule-analysis", async (req, res) => {
+  const teamId = String(req.params.id);
+  try {
+    const standings = await cachedFetch("nba-standings", `${ESPN_NBA_V2}/standings`, 60 * 60 * 1000);
+    const winPctById = {};
+    let seasonYear = null, seasonDisplayName = null;
+    for (const conf of standings.children || []) {
+      seasonYear = seasonYear ?? conf.standings?.season ?? null;
+      seasonDisplayName = seasonDisplayName ?? conf.standings?.seasonDisplayName ?? null;
+      for (const entry of conf.standings?.entries || []) {
+        const wp = entry.stats?.find((s) => s.name === "winPercent")?.value;
+        if (entry.team?.id != null && wp != null) winPctById[String(entry.team.id)] = wp;
+      }
+    }
+    if (!seasonYear) return res.status(502).json({ error: "No se pudo determinar la temporada real de referencia" });
+
+    const sched = await cachedFetch(
+      `nba-team-schedule-${teamId}-${seasonYear}`,
+      `${ESPN_NBA_SITE}/teams/${teamId}/schedule?season=${seasonYear}&seasontype=2`,
+      60 * 60 * 1000
+    );
+    let sosSum = 0, sosCount = 0;
+    for (const e of sched.events || []) {
+      const comp = e.competitions?.[0];
+      if (!comp?.status?.type?.completed) continue;
+      const opp = (comp.competitors || []).find((c) => String(c.team?.id) !== teamId);
+      const wp = opp ? winPctById[String(opp.team?.id)] : null;
+      if (wp != null) { sosSum += wp; sosCount++; }
+    }
+    res.json({
+      avgOpponentWinPct: sosCount > 0 ? sosSum / sosCount : null,
+      gamesPlayed: sosCount,
+      seasonYear, seasonDisplayName,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ---- GET /api/nba/rest?date=YYYY-MM-DD ----
+// Equipos que jugaron AYER (día anterior en hora del Este) — para detectar
+// el segundo juego de un back-to-back con el calendario real, sin
+// suposiciones. Devuelve los códigos que jugaron y si fue pretemporada.
+app.get("/api/nba/rest", async (req, res) => {
+  try {
+    const date = req.query.date || todayET();
+    const prev = shiftDate(date, -1);
+    const data = await cachedFetch(`nba-scoreboard-${prev}`, `${ESPN_NBA_SITE}/scoreboard?dates=${espnDateParam(prev)}`, 30 * 60 * 1000);
+    const playedYesterday = new Set();
+    for (const g of (data.events || []).map(mapNbaEvent)) {
+      if (g.isPreseason) continue; // en pretemporada los titulares casi no juegan: no cuenta como carga real
+      if (g.homeCode) playedYesterday.add(g.homeCode);
+      if (g.awayCode) playedYesterday.add(g.awayCode);
+    }
+    res.json({ date, previousDate: prev, playedYesterday: [...playedYesterday] });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ==========================================================================
+// ---- NBA: Backtesting real — se guarda la predicción ANTES del juego y se
+// revisa después contra el marcador real de ESPN. Los juegos de
+// pretemporada NO se guardan (no miden la fuerza real del equipo titular).
+// ==========================================================================
+
+app.post("/api/nba/predictions/save", async (req, res) => {
+  const { game_date, home_code, away_code, home_win_prob } = req.body || {};
+  if (!game_date || !home_code || !away_code || home_win_prob == null) {
+    return res.status(400).json({ error: "Faltan datos requeridos" });
+  }
+  try {
+    const checkUrl = `${SUPABASE_URL}/rest/v1/nba_predictions?game_date=eq.${game_date}&home_code=eq.${home_code}&away_code=eq.${away_code}&select=id`;
+    const existing = await fetch(checkUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    if (Array.isArray(existing) && existing.length > 0) return res.json({ saved: false, reason: "ya existía" });
+    const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/nba_predictions`, {
+      method: "POST",
+      headers: { ...supabaseHeaders, Prefer: "return=representation" },
+      body: JSON.stringify([{ game_date, home_code, away_code, home_win_prob }]),
+    });
+    if (!insertRes.ok) {
+      const bodyText = await insertRes.text().catch(() => "(sin cuerpo)");
+      console.error(`[nba/predictions/save] Supabase insert error ${insertRes.status}:`, bodyText);
+      throw new Error(`Supabase insert error ${insertRes.status}: ${bodyText}`);
+    }
+    res.json({ saved: true });
+  } catch (err) {
+    console.error("[nba/predictions/save] Error:", err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post("/api/nba/predictions/check", async (req, res) => {
+  try {
+    const today = todayET();
+    const pendingUrl = `${SUPABASE_URL}/rest/v1/nba_predictions?checked_at=is.null&game_date=lt.${today}&select=*`;
+    const pending = await fetch(pendingUrl, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(pending)) {
+      console.error("[nba/predictions/check] Respuesta inesperada de Supabase (¿falta la tabla nba_predictions?):", JSON.stringify(pending).slice(0, 300));
+      return res.json({ checked: 0, updated: 0 });
+    }
+    const results = await Promise.all(
+      pending.map(async (pred) => {
+        const data = await cachedFetch(`nba-scoreboard-${pred.game_date}`, `${ESPN_NBA_SITE}/scoreboard?dates=${espnDateParam(pred.game_date)}`, 15 * 60 * 1000);
+        const match = (data.events || []).map(mapNbaEvent).find(
+          (g) => g.homeCode === pred.home_code && g.awayCode === pred.away_code && g.completed
+        );
+        if (!match || match.homeScore == null || match.awayScore == null || match.homeScore === match.awayScore) return false;
+        const winner = match.homeScore > match.awayScore ? pred.home_code : pred.away_code;
+        await fetch(`${SUPABASE_URL}/rest/v1/nba_predictions?id=eq.${pred.id}`, {
+          method: "PATCH",
+          headers: supabaseHeaders,
+          body: JSON.stringify({ actual_winner: winner, checked_at: new Date().toISOString() }),
+        });
+        return true;
+      })
+    );
+    res.json({ checked: pending.length, updated: results.filter(Boolean).length });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get("/api/nba/predictions/accuracy", async (req, res) => {
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/nba_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
+    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.json({ totalChecked: 0, accuracy: null, brierScore: null, recent: [] });
+    }
+    let correct = 0, brierSum = 0;
+    for (const row of rows) {
+      const fav = row.home_win_prob >= 0.5 ? row.home_code : row.away_code;
+      if (fav === row.actual_winner) correct++;
+      brierSum += Math.pow(row.home_win_prob - (row.actual_winner === row.home_code ? 1 : 0), 2);
+    }
+    res.json({
+      totalChecked: rows.length,
+      accuracy: correct / rows.length,
+      brierScore: brierSum / rows.length,
+      recent: rows.slice(0, 15).map((r) => ({
+        date: r.game_date, home: r.home_code, away: r.away_code,
+        homeWinProb: r.home_win_prob, actualWinner: r.actual_winner,
+      })),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get("/api/nba/backtest-status", async (req, res) => {
+  try {
+    const rows = await fetch(`${SUPABASE_URL}/rest/v1/nba_predictions?select=id,checked_at`, { headers: supabaseHeaders }).then((r) => r.json());
+    if (!Array.isArray(rows)) return res.json({ predictions: { exists: false, total: 0, pending: 0 } });
+    res.json({ predictions: { exists: true, total: rows.length, pending: rows.filter((r) => r.checked_at == null).length } });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
