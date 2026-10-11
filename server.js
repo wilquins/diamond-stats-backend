@@ -3989,6 +3989,55 @@ app.get("/api/nba/debug/gamelog/:id", async (req, res) => {
   }
 });
 
+// ---- Fase 3b: registro REAL juego por juego (temporada regular) ----
+// Estructura verificada en vivo: seasonTypes[] (displayName con "Regular
+// Season") -> categories[] (uno por mes) -> events[{eventId, stats[]}], con
+// las columnas descritas por el arreglo "labels" (MIN, REB, AST, PTS, ...).
+// Se cuentan solo juegos donde jugó (MIN > 0).
+async function getNbaGameValues(athleteId, season) {
+  try {
+    const d = await cachedFetch(
+      `nba-gamelog-${athleteId}-${season}`,
+      `https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/${athleteId}/gamelog?season=${season}`,
+      6 * 60 * 60 * 1000
+    );
+    const labels = d.labels || [];
+    const iMin = labels.indexOf("MIN"), iReb = labels.indexOf("REB"), iAst = labels.indexOf("AST"), iPts = labels.indexOf("PTS");
+    if ([iMin, iReb, iAst, iPts].some((i) => i < 0)) return null;
+    const seen = new Set();
+    const out = { pts: [], reb: [], ast: [] };
+    for (const st of d.seasonTypes || []) {
+      if (!/regular season/i.test(st.displayName || "")) continue;
+      for (const cat of st.categories || []) {
+        for (const ev of cat.events || []) {
+          if (seen.has(ev.eventId)) continue;
+          seen.add(ev.eventId);
+          const num = (i) => { const n = Number(ev.stats?.[i]); return Number.isFinite(n) ? n : null; };
+          const min = num(iMin), reb = num(iReb), ast = num(iAst), pts = num(iPts);
+          if (!min || min <= 0 || reb == null || ast == null || pts == null) continue; // no jugó
+          out.pts.push(pts); out.reb.push(reb); out.ast.push(ast);
+        }
+      }
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+// ---- GET /api/nba/player/:id/game-values?season=YYYY ----
+app.get("/api/nba/player/:id/game-values", async (req, res) => {
+  try {
+    const season = req.query.season;
+    if (!season) return res.status(400).json({ error: "Se requiere season" });
+    const v = await getNbaGameValues(req.params.id, season);
+    if (!v) return res.json({ games: 0, values: null });
+    res.json({ games: v.pts.length, values: v });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // ---- Backtesting de picks de jugadores NBA ----
 app.post("/api/nba/picks/save", async (req, res) => {
   const picks = req.body?.picks;
@@ -4007,11 +4056,13 @@ app.post("/api/nba/picks/save", async (req, res) => {
     let saved = 0;
     for (const p of picks) {
       const { pick_date, pick_type, player_id, player_name, team_code, predicted_prob } = p;
-      if (!pick_date || !["team", "dd", "td"].includes(pick_type) || !team_code || predicted_prob == null) continue;
+      if (!pick_date || !["team", "dd", "td", "pts", "reb", "ast"].includes(pick_type) || !team_code || predicted_prob == null) continue;
+      const row = { pick_date, pick_type, player_id: player_id || null, player_name: player_name || team_code, team_code, predicted_prob };
+      if (p.threshold != null) row.threshold = Number(p.threshold); // solo si existe, para no romper si la columna aún no se creó
       const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/nba_daily_picks`, {
         method: "POST",
         headers: { ...supabaseHeaders, Prefer: "return=representation" },
-        body: JSON.stringify([{ pick_date, pick_type, player_id: player_id || null, player_name: player_name || team_code, team_code, predicted_prob }]),
+        body: JSON.stringify([row]),
       });
       if (insertRes.ok) saved++;
       else console.error(`[nba/picks/save] Supabase insert error ${insertRes.status}:`, await insertRes.text().catch(() => "(sin cuerpo)"));
@@ -4041,7 +4092,7 @@ app.post("/api/nba/picks/check", async (req, res) => {
           if (pick.pick_type === "team") {
             const isHome = match.homeCode === pick.team_code;
             success = isHome ? match.homeWinner : match.awayWinner;
-          } else if ((pick.pick_type === "dd" || pick.pick_type === "td") && pick.player_id) {
+          } else if (["dd", "td", "pts", "reb", "ast"].includes(pick.pick_type) && pick.player_id) {
             const sum = await cachedFetch(`nba-summary-${match.id}`, `${ESPN_NBA_SITE}/summary?event=${match.id}`, 24 * 60 * 60 * 1000);
             let entry = null, keys = null;
             for (const t of sum.boxscore?.players || []) {
@@ -4054,8 +4105,14 @@ app.post("/api/nba/picks/check", async (req, res) => {
               voided = true; // no jugó: no cuenta ni a favor ni en contra
             } else {
               const val = (k) => { const i = keys.indexOf(k); const n = i >= 0 ? Number(entry.stats[i]) : 0; return Number.isFinite(n) ? n : 0; };
-              const cats = ["points", "rebounds", "assists", "steals", "blocks"].filter((k) => val(k) >= 10).length;
-              success = pick.pick_type === "dd" ? cats >= 2 : cats >= 3;
+              if (pick.pick_type === "dd" || pick.pick_type === "td") {
+                const cats = ["points", "rebounds", "assists", "steals", "blocks"].filter((k) => val(k) >= 10).length;
+                success = pick.pick_type === "dd" ? cats >= 2 : cats >= 3;
+              } else {
+                if (pick.threshold == null) return false; // sin umbral guardado no se puede revisar
+                const key = pick.pick_type === "pts" ? "points" : pick.pick_type === "reb" ? "rebounds" : "assists";
+                success = val(key) >= Number(pick.threshold);
+              }
             }
           }
           if (success == null && !voided) return false;
@@ -4081,18 +4138,18 @@ app.get("/api/nba/picks/accuracy", async (req, res) => {
     const rows = await fetch(`${SUPABASE_URL}/rest/v1/nba_daily_picks?checked_at=not.is.null&select=*&order=pick_date.desc`, { headers: supabaseHeaders }).then((r) => r.json());
     if (!Array.isArray(rows)) {
       const empty = { accuracy: null, total: 0 };
-      return res.json({ teams: empty, dd: empty, td: empty, recent: [] });
+      return res.json({ teams: empty, dd: empty, td: empty, pts: empty, reb: empty, ast: empty, recent: [] });
     }
     const counted = rows.filter((r) => r.actual_success !== null && r.actual_success !== undefined); // sin los que no jugaron
     const summarize = (type) => {
       const f = counted.filter((r) => r.pick_type === type);
       if (f.length === 0) return { accuracy: null, total: 0 };
-      return { accuracy: f.filter((r) => r.actual_success === true).length / f.length, total: f.length };
+      return { accuracy: f.filter((r) => r.actual_success === true).length / f.length, avgPredicted: f.reduce((x, r) => x + (r.predicted_prob || 0), 0) / f.length, total: f.length };
     };
     res.json({
-      teams: summarize("team"), dd: summarize("dd"), td: summarize("td"),
+      teams: summarize("team"), dd: summarize("dd"), td: summarize("td"), pts: summarize("pts"), reb: summarize("reb"), ast: summarize("ast"),
       voided: rows.length - counted.length,
-      recent: counted.slice(0, 20).map((r) => ({ date: r.pick_date, type: r.pick_type, name: r.player_name, team: r.team_code, prob: r.predicted_prob, success: r.actual_success })),
+      recent: counted.slice(0, 20).map((r) => ({ date: r.pick_date, type: r.pick_type, name: r.player_name, team: r.team_code, prob: r.predicted_prob, threshold: r.threshold ?? null, success: r.actual_success })),
     });
   } catch (err) {
     res.status(502).json({ error: err.message });
