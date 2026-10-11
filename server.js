@@ -3003,8 +3003,10 @@ app.post("/api/nhl/predictions/check", async (req, res) => {
 // ---- GET /api/nhl/predictions/accuracy ----
 app.get("/api/nhl/predictions/accuracy", async (req, res) => {
   try {
-    const url = `${SUPABASE_URL}/rest/v1/nhl_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
-    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    const since = req.query.since; // opcional ?since=YYYY-MM-DD: mide solo después de un cambio de modelo
+    const sinceFilter = since ? `&game_date=gte.${since}` : "";
+    const url = `${SUPABASE_URL}/rest/v1/nhl_predictions?checked_at=not.is.null${sinceFilter}&select=*&order=game_date.desc`;
+    const rows = dedupeGames(await fetch(url, { headers: supabaseHeaders }).then((r) => r.json()));
     if (!Array.isArray(rows) || rows.length === 0) {
       return res.json({ totalChecked: 0, accuracy: null, brierScore: null, recent: [] });
     }
@@ -3095,8 +3097,10 @@ app.post("/api/nhl/overunder/check", async (req, res) => {
 // ---- GET /api/nhl/overunder/accuracy ----
 app.get("/api/nhl/overunder/accuracy", async (req, res) => {
   try {
-    const url = `${SUPABASE_URL}/rest/v1/nhl_overunder_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
-    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    const since = req.query.since; // opcional ?since=YYYY-MM-DD: mide solo después de un cambio de modelo
+    const sinceFilter = since ? `&game_date=gte.${since}` : "";
+    const url = `${SUPABASE_URL}/rest/v1/nhl_overunder_predictions?checked_at=not.is.null${sinceFilter}&select=*&order=game_date.desc`;
+    const rows = dedupeGames(await fetch(url, { headers: supabaseHeaders }).then((r) => r.json()));
     if (!Array.isArray(rows) || rows.length === 0) {
       return res.json({ totalChecked: 0, accuracy: null, recent: [] });
     }
@@ -3626,8 +3630,10 @@ app.post("/api/nba/predictions/check", async (req, res) => {
 
 app.get("/api/nba/predictions/accuracy", async (req, res) => {
   try {
-    const url = `${SUPABASE_URL}/rest/v1/nba_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
-    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    const since = req.query.since; // opcional ?since=YYYY-MM-DD: mide solo después de un cambio de modelo
+    const sinceFilter = since ? `&game_date=gte.${since}` : "";
+    const url = `${SUPABASE_URL}/rest/v1/nba_predictions?checked_at=not.is.null${sinceFilter}&select=*&order=game_date.desc`;
+    const rows = dedupeGames(await fetch(url, { headers: supabaseHeaders }).then((r) => r.json()));
     if (!Array.isArray(rows) || rows.length === 0) {
       return res.json({ totalChecked: 0, accuracy: null, brierScore: null, recent: [] });
     }
@@ -3836,8 +3842,10 @@ app.post("/api/nba/overunder/check", async (req, res) => {
 
 app.get("/api/nba/overunder/accuracy", async (req, res) => {
   try {
-    const url = `${SUPABASE_URL}/rest/v1/nba_overunder_predictions?checked_at=not.is.null&select=*&order=game_date.desc`;
-    const rows = await fetch(url, { headers: supabaseHeaders }).then((r) => r.json());
+    const since = req.query.since; // opcional ?since=YYYY-MM-DD: mide solo después de un cambio de modelo
+    const sinceFilter = since ? `&game_date=gte.${since}` : "";
+    const url = `${SUPABASE_URL}/rest/v1/nba_overunder_predictions?checked_at=not.is.null${sinceFilter}&select=*&order=game_date.desc`;
+    const rows = dedupeGames(await fetch(url, { headers: supabaseHeaders }).then((r) => r.json()));
     if (!Array.isArray(rows) || rows.length === 0) return res.json({ totalChecked: 0, accuracy: null, recent: [] });
     const decisive = rows.filter((r) => r.actual_result !== "push");
     let correct = 0;
