@@ -4236,3 +4236,66 @@ app.get("/api/nfl/league-home", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// ==========================================================================
+// ---- MLB: historial REAL de un abridor contra un equipo (varias temporadas) ----
+// Fuente verificada en vivo: MLB Stats API, people/{id}/stats?stats=gameLog&
+// group=pitching&season=YYYY -> por juego: oponente, isHome, gamesStarted,
+// wins, losses (la decisión DEL PITCHER, no el marcador del equipo),
+// inningsPitched (string "7.2" = 7 2/3), earnedRuns, strikeOuts.
+// ATENCIÓN: el campo "era" de cada juego es el ERA ACUMULADO de la
+// temporada hasta ese día, NO el de ese juego; por eso el ERA se calcula
+// aquí con carreras limpias e innings.
+// ==========================================================================
+function mlbInningsToNumber(ip) {
+  const s = String(ip ?? "0");
+  const [whole, frac] = s.split(".");
+  return Number(whole || 0) + Number(frac || 0) / 3;
+}
+
+app.get("/api/pitcher/:id/vs-team/:oppCode", async (req, res) => {
+  const oppId = TEAM_IDS[String(req.params.oppCode).toUpperCase()];
+  if (!oppId) return res.status(404).json({ error: "Código de equipo no reconocido" });
+  const pitcherId = req.params.id;
+  const nSeasons = Math.min(8, Math.max(1, Number(req.query.seasons) || 5));
+  try {
+    const thisYear = Number(todayET().slice(0, 4));
+    const years = Array.from({ length: nSeasons }, (_, i) => thisYear - i);
+    const logs = await Promise.all(
+      years.map((y) =>
+        cachedFetch(`pitcher-gamelog-${pitcherId}-${y}`, `${MLB_API}/people/${pitcherId}/stats?stats=gameLog&group=pitching&season=${y}`, 6 * 60 * 60 * 1000)
+          .catch(() => null)
+      )
+    );
+    const blank = () => ({ starts: 0, wins: 0, losses: 0, ip: 0, er: 0, k: 0 });
+    const all = blank(), vs = blank(), vsHome = blank(), vsRoad = blank();
+    const seasonsWithData = [];
+    logs.forEach((d, i) => {
+      const splits = d?.stats?.[0]?.splits || [];
+      let any = false;
+      for (const sp of splits) {
+        const st = sp.stat || {};
+        if (Number(st.gamesStarted) !== 1) continue; // solo aperturas, no relevos
+        any = true;
+        const add = (t) => {
+          t.starts++; t.wins += Number(st.wins) || 0; t.losses += Number(st.losses) || 0;
+          t.ip += mlbInningsToNumber(st.inningsPitched); t.er += Number(st.earnedRuns) || 0; t.k += Number(st.strikeOuts) || 0;
+        };
+        add(all);
+        if (sp.opponent?.id === oppId) {
+          add(vs);
+          add(sp.isHome ? vsHome : vsRoad);
+        }
+      }
+      if (any) seasonsWithData.push(years[i]);
+    });
+    const era = (t) => (t.ip > 0 ? (t.er * 9) / t.ip : null);
+    const pack = (t) => ({ starts: t.starts, wins: t.wins, losses: t.losses, noDecision: t.starts - t.wins - t.losses, ip: Math.round(t.ip * 10) / 10, er: t.er, k: t.k, era: era(t) });
+    res.json({
+      pitcherId, opponent: String(req.params.oppCode).toUpperCase(), seasons: seasonsWithData,
+      overall: pack(all), vsTeam: pack(vs), vsTeamAtHome: pack(vsHome), vsTeamOnRoad: pack(vsRoad),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
