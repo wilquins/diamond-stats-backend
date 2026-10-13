@@ -2899,6 +2899,7 @@ async function getRealGoalieStats(code, seasonId, goalieName) {
   });
   if (!found) return null;
   return {
+    id: found.playerId ?? null,
     name: `${found.firstName?.default || ""} ${found.lastName?.default || ""}`.trim(),
     gamesPlayed: found.gamesPlayed ?? null,
     savePercentage: found.savePercentage ?? null,
@@ -4293,6 +4294,69 @@ app.get("/api/pitcher/:id/vs-team/:oppCode", async (req, res) => {
     const pack = (t) => ({ starts: t.starts, wins: t.wins, losses: t.losses, noDecision: t.starts - t.wins - t.losses, ip: Math.round(t.ip * 10) / 10, er: t.er, k: t.k, era: era(t) });
     res.json({
       pitcherId, opponent: String(req.params.oppCode).toUpperCase(), seasons: seasonsWithData,
+      overall: pack(all), vsTeam: pack(vs), vsTeamAtHome: pack(vsHome), vsTeamOnRoad: pack(vsRoad),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ==========================================================================
+// ---- NHL: historial REAL de un portero contra un equipo (varias temporadas) ----
+// Fuente verificada en vivo: NHL API web, player/{id}/game-log/{YYYYYYYY}/2
+// (temporada regular) -> por juego: opponentAbbrev, homeRoadFlag (H/R),
+// gamesStarted, decision (W/L/O), shotsAgainst, goalsAgainst, toi "MM:SS".
+// SV% y GAA se calculan aquí sumando tiros y goles (no promediando
+// porcentajes por juego).
+// ==========================================================================
+app.get("/api/nhl/goalie/:id/vs-team/:oppCode", async (req, res) => {
+  const goalieId = String(req.params.id).replace(/\D/g, "");
+  const opp = String(req.params.oppCode).toUpperCase();
+  if (!goalieId) return res.status(400).json({ error: "ID de portero inválido" });
+  const nSeasons = Math.min(8, Math.max(1, Number(req.query.seasons) || 5));
+  try {
+    const standingsData = await cachedFetch("nhl-standings", `${NHL_API}/standings/now`, 60 * 60 * 1000);
+    const curId = standingsData.standings?.[0]?.seasonId;
+    if (!curId) return res.status(502).json({ error: "No se pudo determinar la temporada real de referencia" });
+    const startYear = Number(String(curId).slice(0, 4));
+    const seasonIds = Array.from({ length: nSeasons }, (_, i) => `${startYear - i}${startYear - i + 1}`);
+    const logs = await Promise.all(
+      seasonIds.map((sid) =>
+        cachedFetch(`nhl-goalie-gamelog-${goalieId}-${sid}`, `${NHL_API}/player/${goalieId}/game-log/${sid}/2`, 6 * 60 * 60 * 1000).catch(() => null)
+      )
+    );
+    const blank = () => ({ starts: 0, wins: 0, losses: 0, otl: 0, sa: 0, ga: 0, min: 0 });
+    const all = blank(), vs = blank(), vsHome = blank(), vsRoad = blank();
+    const seasonsWithData = [];
+    logs.forEach((d, i) => {
+      let any = false;
+      for (const g of d?.gameLog || []) {
+        if (Number(g.gamesStarted) !== 1) continue; // solo aperturas, no relevos
+        any = true;
+        const [mm, ss] = String(g.toi || "0:0").split(":");
+        const minutes = Number(mm || 0) + Number(ss || 0) / 60;
+        const add = (t) => {
+          t.starts++;
+          if (g.decision === "W") t.wins++; else if (g.decision === "L") t.losses++; else if (g.decision === "O") t.otl++;
+          t.sa += Number(g.shotsAgainst) || 0; t.ga += Number(g.goalsAgainst) || 0; t.min += minutes;
+        };
+        add(all);
+        if (String(g.opponentAbbrev).toUpperCase() === opp) {
+          add(vs);
+          add(g.homeRoadFlag === "H" ? vsHome : vsRoad);
+        }
+      }
+      if (any) seasonsWithData.push(seasonIds[i]);
+    });
+    const pack = (t) => ({
+      starts: t.starts, wins: t.wins, losses: t.losses, otLosses: t.otl,
+      noDecision: t.starts - t.wins - t.losses - t.otl,
+      shotsAgainst: t.sa, goalsAgainst: t.ga,
+      savePct: t.sa > 0 ? 1 - t.ga / t.sa : null,
+      gaa: t.min > 0 ? (t.ga * 60) / t.min : null,
+    });
+    res.json({
+      goalieId, opponent: opp, seasons: seasonsWithData,
       overall: pack(all), vsTeam: pack(vs), vsTeamAtHome: pack(vsHome), vsTeamOnRoad: pack(vsRoad),
     });
   } catch (err) {
