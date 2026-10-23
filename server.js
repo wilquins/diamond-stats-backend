@@ -2031,6 +2031,26 @@ app.get("/api/nfl/weather/:code", async (req, res) => {
   }
 });
 
+// ---- GET /api/nfl/odds — cuotas reales (ESPN/DraftKings) de la semana en curso ----
+app.get("/api/nfl/odds", async (req, res) => {
+  try {
+    const sb = await cachedFetch(
+      "espn-nfl-scoreboard-odds",
+      "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
+      10 * 60 * 1000
+    );
+    const games = (sb.events || []).map((e) => {
+      const comp = e.competitions?.[0];
+      const h = (comp?.competitors || []).find((c) => c.homeAway === "home");
+      const a = (comp?.competitors || []).find((c) => c.homeAway === "away");
+      return { eventId: String(e.id), homeName: h?.team?.displayName ?? null, awayName: a?.team?.displayName ?? null, date: e.date ?? null, odds: parseEspnOdds(e) };
+    });
+    res.json({ games });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // ---- POST /api/nfl/overunder/save ----
 app.post("/api/nfl/overunder/save", async (req, res) => {
   const { game_date, week, home_code, away_code, line, over_prob, expected_total } = req.body || {};
@@ -2858,6 +2878,60 @@ app.get("/api/nhl/team/:code/schedule-analysis", async (req, res) => {
 // específico, igual que ya hacemos con el ERA promedio de liga en MLB.
 const NHL_LEAGUE_AVG_SAVE_PCT = 0.903;
 
+// ---- Cuotas REALES de casas de apuestas, publicadas por ESPN (proveedor
+// DraftKings) dentro del scoreboard de cada deporte. Estructura verificada en
+// vivo (oct 2026): events[i].competitions[0].odds[0] con provider.name,
+// details, overUnder, spread y moneyline.{home,away}.close.odds ("-175"/"+145").
+// Solo se EXPONEN como referencia: la línea de Over/Under real y la
+// probabilidad implícita (sin el margen de la casa).
+function parseEspnOdds(event) {
+  const o = event?.competitions?.[0]?.odds?.[0];
+  if (!o) return null;
+  const num = (v) => {
+    const t = String(v ?? "").trim().replace(/^\+/, "");
+    if (t === "") return null;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : null;
+  };
+  const ml = (side) => num(o.moneyline?.[side]?.close?.odds);
+  const toProb = (m) => (m == null ? null : m < 0 ? -m / (-m + 100) : 100 / (m + 100));
+  const hp = toProb(ml("home"));
+  const ap = toProb(ml("away"));
+  return {
+    provider: o.provider?.name ?? null,
+    details: o.details ?? null,
+    overUnder: num(o.overUnder),
+    spread: num(o.spread),
+    homeMoneyline: ml("home"),
+    awayMoneyline: ml("away"),
+    marketHomeProb: hp != null && ap != null ? hp / (hp + ap) : null,
+  };
+}
+
+// ---- GET /api/nhl/odds/:homeCode/:awayCode?date&homeName&awayName ----
+app.get("/api/nhl/odds/:homeCode/:awayCode", async (req, res) => {
+  const date = req.query.date || todayET();
+  const { homeName, awayName } = req.query;
+  if (!homeName || !awayName) {
+    return res.status(400).json({ error: "Se requieren homeName y awayName (nombre completo real del equipo) para emparejar con ESPN" });
+  }
+  try {
+    const scoreboard = await cachedFetch(
+      `espn-nhl-scoreboard-${date}`,
+      `https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard?dates=${date.replace(/-/g, "")}`,
+      15 * 60 * 1000
+    );
+    const norm = (x) => (x || "").toLowerCase().trim();
+    const match = (scoreboard.events || []).find((e) => {
+      const names = (e.competitions?.[0]?.competitors || []).map((c) => norm(c.team?.displayName));
+      return names.includes(norm(homeName)) && names.includes(norm(awayName));
+    });
+    res.json({ odds: match ? parseEspnOdds(match) : null });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 async function findEspnProbableGoalie(homeFullName, awayFullName, date) {
   const dateParam = date.replace(/-/g, "");
   const scoreboard = await cachedFetch(
@@ -3159,15 +3233,51 @@ app.get("/api/nhl/team/:code/skater-stats", async (req, res) => {
     );
     const skaters = (data.skaters || []).filter((s) => s.positionCode !== "G" && (s.gamesPlayed || 0) > 0);
 
+    // La tasa de goles/asistencias/puntos por juego con 5-8 juegos es casi
+    // puro ruido, y al ordenar el "top 3" por esa tasa se escogen justo los
+    // jugadores con racha (backtesting real: picks de Gol acertaron 30% con
+    // ~55% predicho en 40 picks). Por eso cada tasa se mezcla con un "prior":
+    // la tasa de la temporada anterior del mismo jugador (si jugó 30+ juegos
+    // con este equipo) o, si no hay, la mediana de los patinadores del equipo.
+    // El peso del prior (30 juegos con historial propio, 15 con la mediana del
+    // equipo) es una decisión SUBJETIVA: no se encontró un número publicado
+    // de estabilización para tasas por juego de la NHL.
+    const y = Number(String(seasonId).slice(0, 4));
+    const prevSeasonId = `${y - 1}${y}`;
+    const prevData = await cachedFetch(
+      `nhl-club-stats-${code}-${prevSeasonId}`,
+      `${NHL_API}/club-stats/${code}/${prevSeasonId}/2`,
+      6 * 60 * 60 * 1000
+    ).catch(() => null);
+    const prevById = new Map();
+    for (const p of prevData?.skaters || []) {
+      if ((p.gamesPlayed || 0) >= 30) prevById.set(p.playerId, p);
+    }
+    const median = (arr) => {
+      if (arr.length === 0) return 0;
+      const a = [...arr].sort((m, n) => m - n);
+      const mid = Math.floor(a.length / 2);
+      return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+    };
+    const teamMedian = {
+      goals: median(skaters.map((s) => s.goals / s.gamesPlayed)),
+      assists: median(skaters.map((s) => (s.assists || 0) / s.gamesPlayed)),
+      points: median(skaters.map((s) => (s.points || 0) / s.gamesPlayed)),
+    };
+    const PRIOR_GAMES_OWN = 30;
+    const PRIOR_GAMES_TEAM = 15;
+
     const players = skaters.map((s) => {
+      const prev = prevById.get(s.playerId);
+      const priorGames = prev ? PRIOR_GAMES_OWN : PRIOR_GAMES_TEAM;
+      const adjRate = (cur, key, medianRate) => {
+        const prior = prev ? (prev[key] || 0) / prev.gamesPlayed : medianRate;
+        return (cur + prior * priorGames) / (s.gamesPlayed + priorGames);
+      };
       const goalsPerGame = s.goals / s.gamesPlayed;
-      // Probabilidad real de al menos 1 gol vía Poisson — mismo
-      // principio que ya usamos para TD (NFL) y jonrones (MLB).
-      const goalProbability = 1 - Math.exp(-goalsPerGame);
-      // Asistencias y puntos (goles + asistencias): mismo principio —
-      // Poisson sobre su tasa real por juego esta temporada.
-      const assistsPerGame = (s.assists || 0) / s.gamesPlayed;
-      const pointsPerGame = (s.points || 0) / s.gamesPlayed;
+      const goalsAdj = adjRate(s.goals, "goals", teamMedian.goals);
+      const assistsAdj = adjRate(s.assists || 0, "assists", teamMedian.assists);
+      const pointsAdj = adjRate(s.points || 0, "points", teamMedian.points);
       return {
         id: s.playerId,
         name: `${s.firstName?.default || ""} ${s.lastName?.default || ""}`.trim(),
@@ -3175,11 +3285,14 @@ app.get("/api/nhl/team/:code/skater-stats", async (req, res) => {
         gamesPlayed: s.gamesPlayed,
         goals: s.goals,
         goalsPerGame,
-        goalProbability,
+        // Probabilidad de al menos 1 gol vía Poisson sobre la tasa ya mezclada con el prior.
+        goalProbability: 1 - Math.exp(-goalsAdj),
+        rawGoalProbability: 1 - Math.exp(-goalsPerGame),
         assists: s.assists || 0,
-        assistProbability: 1 - Math.exp(-assistsPerGame),
+        assistProbability: 1 - Math.exp(-assistsAdj),
         points: s.points || 0,
-        pointProbability: 1 - Math.exp(-pointsPerGame),
+        pointProbability: 1 - Math.exp(-pointsAdj),
+        priorSource: prev ? "temporada anterior" : "mediana del equipo",
       };
     });
 
