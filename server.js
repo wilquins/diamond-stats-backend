@@ -3538,6 +3538,22 @@ function mapNbaEvent(e) {
   };
 }
 
+// ---- GET /api/nba/odds — líneas reales (ESPN/DraftKings) de los juegos de hoy ----
+app.get("/api/nba/odds", async (req, res) => {
+  try {
+    const sb = await cachedFetch("espn-nba-scoreboard-today-odds", `${ESPN_NBA_SITE}/scoreboard`, 10 * 60 * 1000);
+    const games = (sb.events || []).map((e) => {
+      const comp = e.competitions?.[0];
+      const h = (comp?.competitors || []).find((c) => c.homeAway === "home");
+      const a = (comp?.competitors || []).find((c) => c.homeAway === "away");
+      return { eventId: String(e.id), homeCode: h?.team?.abbreviation ?? null, awayCode: a?.team?.abbreviation ?? null, date: e.date ?? null, odds: parseEspnOdds(e) };
+    });
+    res.json({ games });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // ---- GET /api/nba/games?date=YYYY-MM-DD ----
 app.get("/api/nba/games", async (req, res) => {
   try {
