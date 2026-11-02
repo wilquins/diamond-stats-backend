@@ -2909,6 +2909,10 @@ function parseEspnOdds(event) {
 }
 
 // ---- GET /api/nhl/odds/:homeCode/:awayCode?date&homeName&awayName ----
+// Primero busca en el scoreboard "de hoy" de ESPN (el que trae las cuotas, verificado
+// en vivo con DraftKings) y, si el juego no está o no trae línea, en el scoreboard
+// de esa fecha. Backtesting real: con solo el scoreboard por fecha NO se guardó
+// ningún Over/Under con línea real del 23 de oct al 2 de nov.
 app.get("/api/nhl/odds/:homeCode/:awayCode", async (req, res) => {
   const date = req.query.date || todayET();
   const { homeName, awayName } = req.query;
@@ -2916,17 +2920,24 @@ app.get("/api/nhl/odds/:homeCode/:awayCode", async (req, res) => {
     return res.status(400).json({ error: "Se requieren homeName y awayName (nombre completo real del equipo) para emparejar con ESPN" });
   }
   try {
-    const scoreboard = await cachedFetch(
-      `espn-nhl-scoreboard-${date}`,
-      `https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard?dates=${date.replace(/-/g, "")}`,
-      15 * 60 * 1000
-    );
     const norm = (x) => (x || "").toLowerCase().trim();
-    const match = (scoreboard.events || []).find((e) => {
-      const names = (e.competitions?.[0]?.competitors || []).map((c) => norm(c.team?.displayName));
-      return names.includes(norm(homeName)) && names.includes(norm(awayName));
-    });
-    res.json({ odds: match ? parseEspnOdds(match) : null });
+    const findIn = (sb) =>
+      (sb?.events || []).find((e) => {
+        const names = (e.competitions?.[0]?.competitors || []).map((c) => norm(c.team?.displayName));
+        return names.includes(norm(homeName)) && names.includes(norm(awayName));
+      });
+    const base = "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard";
+    const today = await cachedFetch("espn-nhl-scoreboard-today-odds", base, 10 * 60 * 1000).catch(() => null);
+    let odds = null;
+    let source = null;
+    const m1 = findIn(today);
+    if (m1) { odds = parseEspnOdds(m1); if (odds) source = "hoy"; }
+    if (!odds) {
+      const dated = await cachedFetch(`espn-nhl-scoreboard-${date}`, `${base}?dates=${date.replace(/-/g, "")}`, 15 * 60 * 1000).catch(() => null);
+      const m2 = findIn(dated);
+      if (m2) { odds = parseEspnOdds(m2); if (odds) source = "fecha"; }
+    }
+    res.json({ odds, source, eventsToday: today?.events?.length ?? null });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
