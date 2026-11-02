@@ -3680,6 +3680,27 @@ app.get("/api/nba/team/:id/schedule-analysis", async (req, res) => {
     }
     // Desviación estándar REAL de los totales de este equipo en la
     // temporada de referencia (medida, no citada) — base del Over/Under.
+    // Al inicio de temporada (menos de 20 juegos terminados) se completan con
+    // los totales REALES de la temporada anterior del mismo equipo.
+    let totalsSource = "temporada actual";
+    if (totals.length < 20) {
+      try {
+        const prevSched = await cachedFetch(
+          `nba-team-schedule-${teamId}-${Number(seasonYear) - 1}`,
+          `${ESPN_NBA_SITE}/teams/${teamId}/schedule?season=${Number(seasonYear) - 1}&seasontype=2`,
+          6 * 60 * 60 * 1000
+        );
+        for (const e of prevSched.events || []) {
+          const comp = e.competitions?.[0];
+          if (!comp?.status?.type?.completed) continue;
+          const opp = (comp.competitors || []).find((c) => String(c.team?.id) !== teamId);
+          const self = (comp.competitors || []).find((c) => String(c.team?.id) === teamId);
+          const a = Number(self?.score?.value ?? self?.score), b = Number(opp?.score?.value ?? opp?.score);
+          if (Number.isFinite(a) && Number.isFinite(b) && a + b > 0) totals.push(a + b);
+        }
+        totalsSource = "temporada actual + anterior";
+      } catch { /* se queda con lo que haya */ }
+    }
     let avgTotal = null, totalSD = null;
     if (totals.length >= 20) {
       avgTotal = totals.reduce((x, y) => x + y, 0) / totals.length;
@@ -3688,7 +3709,7 @@ app.get("/api/nba/team/:id/schedule-analysis", async (req, res) => {
     res.json({
       avgOpponentWinPct: sosCount > 0 ? sosSum / sosCount : null,
       gamesPlayed: sosCount,
-      avgTotal, totalSD, totalGames: totals.length,
+      avgTotal, totalSD, totalGames: totals.length, totalsSource,
       seasonYear, seasonDisplayName,
     });
   } catch (err) {
